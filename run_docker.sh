@@ -13,6 +13,7 @@ Usage:
   ./run_docker.sh process VIDEO [--edit-only] [--config FILE] [--force]
   ./run_docker.sh plan VIDEO [--config FILE] [--force]
   ./run_docker.sh summarize OUTPUT_JOB_DIR [--model MODEL] [--config FILE]
+  ./run_docker.sh transcript OUTPUT_JOB_DIR
   ./run_docker.sh test
 EOF
 }
@@ -60,18 +61,18 @@ case "${command}" in
       -m local_video_editor "${command}" "/input/${source_name}" \
       --model-cache /data/models/huggingface/hub "$@"
     ;;
-  summarize)
+  summarize|transcript)
     if [[ $# -eq 1 && "$1" == "--help" ]]; then
-      exec "${common[@]}" -m local_video_editor summarize --help
+      exec "${common[@]}" -m local_video_editor "${command}" --help
     fi
     if [[ $# -lt 1 ]]; then usage; exit 2; fi
     job_dir="$(realpath "$1")"
     shift
     case "${job_dir}" in
       "${PROJECT_ROOT}"/*) container_job="/workspace/${job_dir#"${PROJECT_ROOT}/"}" ;;
-      *) echo "Summary job must be inside ${PROJECT_ROOT}" >&2; exit 2 ;;
+      *) echo "Job must be inside ${PROJECT_ROOT}" >&2; exit 2 ;;
     esac
-    exec "${common[@]}" -m local_video_editor summarize "${container_job}" "$@"
+    exec "${common[@]}" -m local_video_editor "${command}" "${container_job}" "$@"
     ;;
   test)
     exec "${common[@]}" -m unittest discover -s tests -v

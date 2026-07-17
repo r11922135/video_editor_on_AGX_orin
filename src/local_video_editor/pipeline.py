@@ -27,11 +27,12 @@ from .media import (
     render_video,
 )
 from .silence import SilenceConfig, build_edit_plan
-from .summary import summarize_oneshot, write_summary_files
-from .transcript import write_transcript_files
+from .summary import summarize_two_stage, write_summary_files
+from .transcript import render_transcript_markdown, write_transcript_files
 
 
 StatusCallback = Callable[[str, str], None]
+FULL_PIPELINE_REVISION = "cli-two-stage-v3"
 
 
 def _utc_now() -> str:
@@ -48,8 +49,11 @@ def _config_fingerprint(config: dict[str, Any], operation: str = "full") -> str:
         if operation in {"plan", "edit_only"}
         else config
     )
+    identity: dict[str, Any] = {"operation": operation, "config": relevant}
+    if operation == "full":
+        identity["pipeline_revision"] = FULL_PIPELINE_REVISION
     encoded = json.dumps(
-        {"operation": operation, "config": relevant},
+        identity,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -103,6 +107,8 @@ _GENERATED_JOB_FILES = (
     "summary.json",
     "summary.metrics.json",
     "summary.raw.txt",
+    "summary.en.raw.txt",
+    "summary.zh-TW.raw.txt",
     "summary.zh-TW.md",
     "transcript.json",
     "transcript.md",
@@ -113,13 +119,14 @@ _GENERATED_JOB_FILES = (
 def _clear_generated_job_files(job_dir: Path) -> None:
     for name in _GENERATED_JOB_FILES:
         (job_dir / name).unlink(missing_ok=True)
+    shutil.rmtree(job_dir / ".summary.pending", ignore_errors=True)
 
 
 def _default_status(stage: str, message: str) -> None:
     print(f"[{stage}] {message}", flush=True)
 
 
-def _mark_manifest_failed(manifest: dict[str, Any], exc: Exception) -> None:
+def _mark_manifest_failed(manifest: dict[str, Any], exc: BaseException) -> None:
     now = _utc_now()
     error = {"type": type(exc).__name__, "message": str(exc)}
     stages = manifest.setdefault("stages", {})
@@ -347,7 +354,7 @@ class VideoPipeline:
             if edit_only:
                 manifest["status"] = "complete"
                 manifest["completed_at"] = _utc_now()
-                manifest["outputs"] = {"video": str(edited_video)}
+                manifest["outputs"] = {"video": edited_video.name}
                 atomic_write_json(manifest_path, manifest)
                 failure_log.unlink(missing_ok=True)
                 self.status("complete", f"Edit-only job completed: {job_dir}")
@@ -419,16 +426,25 @@ class VideoPipeline:
                 manifest_path,
                 "summary",
                 "running",
-                f"Detailed bilingual overview with {summary_cfg['model']}",
+                f"Two-stage English overview and zh-TW translation with "
+                f"{summary_cfg['model']}",
             )
-            summary, metrics = summarize_oneshot(
+            summary, metrics = summarize_two_stage(
                 segments,
                 source_title=source.stem,
                 ollama_url=str(summary_cfg["ollama_url"]),
                 model=str(summary_cfg["model"]),
                 context_tokens=int(summary_cfg["context_tokens"]),
                 max_output_tokens=int(summary_cfg["max_output_tokens"]),
-                raw_response_path=job_dir / "summary.raw.txt",
+                english_raw_response_path=job_dir / "summary.en.raw.txt",
+                translation_raw_response_path=job_dir / "summary.zh-TW.raw.txt",
+                progress=lambda message: self._stage(
+                    manifest,
+                    manifest_path,
+                    "summary",
+                    "running",
+                    message,
+                ),
             )
             write_summary_files(
                 summary,
@@ -441,7 +457,7 @@ class VideoPipeline:
                 manifest_path,
                 "summary",
                 "complete",
-                f"Bilingual Markdown overview ready ({metrics['model']})",
+                f"Two-stage bilingual Markdown overview ready ({metrics['model']})",
                 **metrics,
             )
 
@@ -449,17 +465,22 @@ class VideoPipeline:
             manifest["status"] = "complete"
             manifest["completed_at"] = _utc_now()
             manifest["outputs"] = {
-                "video": str(edited_video),
-                "transcript_json": str(job_dir / "transcript.json"),
-                "transcript_srt": str(job_dir / "transcript.srt"),
-                "summary_en": str(job_dir / "summary.en.md"),
-                "summary_zh_tw": str(job_dir / "summary.zh-TW.md"),
+                "video": edited_video.name,
+                "transcript_json": "transcript.json",
+                "transcript_srt": "transcript.srt",
+                "transcript_md": "transcript.md",
+                "summary_en": "summary.en.md",
+                "summary_zh_tw": "summary.zh-TW.md",
+                "summary_json": "summary.json",
+                "summary_en_raw": "summary.en.raw.txt",
+                "summary_zh_tw_raw": "summary.zh-TW.raw.txt",
+                "summary_metrics": "summary.metrics.json",
             }
             atomic_write_json(manifest_path, manifest)
             failure_log.unlink(missing_ok=True)
             self.status("complete", f"Job completed: {job_dir}")
             return {"job_id": job_id, "job_dir": str(job_dir), "manifest": manifest}
-        except Exception as exc:
+        except BaseException as exc:
             _mark_manifest_failed(manifest, exc)
             atomic_write_json(manifest_path, manifest)
             atomic_write_text(failure_log, traceback.format_exc())
@@ -483,7 +504,11 @@ def _resummarize_job_unlocked(
     segments = transcript.get("segments", [])
     if not segments:
         raise PipelineError("Transcript has no speech segments to summarize")
-    raw_response_path = job_dir / "summary.raw.txt"
+    pending_dir = job_dir / ".summary.pending"
+    shutil.rmtree(pending_dir, ignore_errors=True)
+    pending_dir.mkdir(mode=0o700)
+    english_raw_response_path = pending_dir / "summary.en.raw.txt"
+    translation_raw_response_path = pending_dir / "summary.zh-TW.raw.txt"
     summary_cfg = dict(config["summary"])
     if model:
         summary_cfg["model"] = model
@@ -491,7 +516,10 @@ def _resummarize_job_unlocked(
     now = _utc_now()
     manifest["status"] = "running"
     manifest["updated_at"] = now
-    summary_message = f"Detailed bilingual overview with {summary_cfg['model']}"
+    summary_message = (
+        f"Two-stage English overview and zh-TW translation with "
+        f"{summary_cfg['model']}"
+    )
     manifest.setdefault("stages", {})["summary"] = {
         "state": "running",
         "updated_at": now,
@@ -500,26 +528,53 @@ def _resummarize_job_unlocked(
     atomic_write_json(manifest_path, manifest)
     try:
         source_title = Path(manifest["source"]["name"]).stem
-        summary, metrics = summarize_oneshot(
+
+        def progress(message: str) -> None:
+            now = _utc_now()
+            manifest.setdefault("stages", {})["summary"] = {
+                "state": "running",
+                "updated_at": now,
+                "message": message,
+            }
+            manifest["updated_at"] = now
+            atomic_write_json(manifest_path, manifest)
+            print(f"[summary] {message}", flush=True)
+
+        summary, metrics = summarize_two_stage(
             segments,
             source_title=source_title,
             ollama_url=str(summary_cfg["ollama_url"]),
             model=str(summary_cfg["model"]),
             context_tokens=int(summary_cfg["context_tokens"]),
             max_output_tokens=int(summary_cfg["max_output_tokens"]),
-            raw_response_path=raw_response_path,
+            english_raw_response_path=english_raw_response_path,
+            translation_raw_response_path=translation_raw_response_path,
+            progress=progress,
         )
         write_summary_files(
             summary,
             metrics,
             source_name=str(manifest["source"]["name"]),
-            output_dir=job_dir,
+            output_dir=pending_dir,
         )
+        for name in (
+            "summary.en.raw.txt",
+            "summary.zh-TW.raw.txt",
+            "summary.json",
+            "summary.metrics.json",
+            "summary.en.md",
+            "summary.zh-TW.md",
+        ):
+            (pending_dir / name).replace(job_dir / name)
+        pending_dir.rmdir()
+        (job_dir / "summary.raw.txt").unlink(missing_ok=True)
         now = _utc_now()
         manifest.setdefault("stages", {})["summary"] = {
             "state": "complete",
             "updated_at": now,
-            "message": f"Bilingual Markdown overview ready ({metrics['model']})",
+            "message": (
+                f"Two-stage bilingual Markdown overview ready ({metrics['model']})"
+            ),
             **metrics,
         }
         outputs = manifest.setdefault("outputs", {})
@@ -527,25 +582,30 @@ def _resummarize_job_unlocked(
             "video": job_dir / "edited.mp4",
             "transcript_json": job_dir / "transcript.json",
             "transcript_srt": job_dir / "transcript.srt",
+            "transcript_md": job_dir / "transcript.md",
         }.items():
             if path.is_file():
-                outputs[key] = str(path)
+                outputs[key] = path.name
         outputs.update(
             {
-                "summary_en": str(job_dir / "summary.en.md"),
-                "summary_zh_tw": str(job_dir / "summary.zh-TW.md"),
+                "summary_en": "summary.en.md",
+                "summary_zh_tw": "summary.zh-TW.md",
+                "summary_json": "summary.json",
+                "summary_en_raw": "summary.en.raw.txt",
+                "summary_zh_tw_raw": "summary.zh-TW.raw.txt",
+                "summary_metrics": "summary.metrics.json",
             }
         )
-        if (job_dir / "edited.mp4").is_file():
-            manifest["status"] = "complete"
-            manifest["completed_at"] = now
+        manifest["status"] = "complete"
+        manifest["completed_at"] = now
         manifest.pop("failed_at", None)
         manifest.pop("error", None)
         manifest["updated_at"] = now
         atomic_write_json(manifest_path, manifest)
         failure_log.unlink(missing_ok=True)
         return metrics
-    except Exception as exc:
+    except BaseException as exc:
+        shutil.rmtree(pending_dir, ignore_errors=True)
         _mark_manifest_failed(manifest, exc)
         atomic_write_json(manifest_path, manifest)
         atomic_write_text(failure_log, traceback.format_exc())
@@ -565,3 +625,46 @@ def resummarize_job(
             config,
             model=model,
         )
+
+
+def _rerender_transcript_job_unlocked(job_dir: Path) -> dict[str, Any]:
+    job_dir = job_dir.expanduser().resolve(strict=True)
+    transcript_path = job_dir / "transcript.json"
+    manifest_path = job_dir / "manifest.json"
+    if not transcript_path.is_file() or not manifest_path.is_file():
+        raise PipelineError("Job must contain transcript.json and manifest.json")
+
+    transcript = read_json(transcript_path)
+    manifest = read_json(manifest_path)
+    segments = transcript.get("segments")
+    if not isinstance(segments, list) or not segments:
+        raise PipelineError("Transcript has no speech segments to format")
+
+    source_name = str(manifest.get("source", {}).get("name", "Transcript"))
+    output_path = job_dir / "transcript.md"
+    atomic_write_text(
+        output_path,
+        render_transcript_markdown(segments, title=Path(source_name).stem),
+    )
+
+    now = _utc_now()
+    manifest.setdefault("outputs", {})["transcript_md"] = output_path.name
+    manifest.setdefault("stages", {})["transcript_format"] = {
+        "state": "complete",
+        "updated_at": now,
+        "message": "Readable Markdown transcript ready",
+        "segment_count": len(segments),
+    }
+    manifest["updated_at"] = now
+    atomic_write_json(manifest_path, manifest)
+    return {
+        "job_dir": str(job_dir),
+        "transcript_md": str(output_path),
+        "segment_count": len(segments),
+    }
+
+
+def rerender_transcript_job(job_dir: Path) -> dict[str, Any]:
+    resolved = job_dir.expanduser().resolve(strict=True)
+    with _pipeline_lock(resolved.parent):
+        return _rerender_transcript_job_unlocked(resolved)

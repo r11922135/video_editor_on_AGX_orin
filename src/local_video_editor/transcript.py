@@ -8,6 +8,13 @@ from typing import Any, Iterable
 from .io_utils import atomic_write_text
 
 
+READABLE_SECTION_SECONDS = 300
+READABLE_PARAGRAPH_GAP_SECONDS = 2.5
+READABLE_PARAGRAPH_MIN_CHARS = 300
+READABLE_PARAGRAPH_MAX_CHARS = 700
+READABLE_PARAGRAPH_MAX_SECONDS = 60.0
+
+
 def timestamp(seconds: float, *, srt: bool = False) -> str:
     millis = max(0, round(float(seconds) * 1000))
     hours, remainder = divmod(millis, 3_600_000)
@@ -30,14 +37,132 @@ def render_srt(segments: Iterable[dict[str, Any]]) -> str:
     return "\n\n".join(blocks) + ("\n" if blocks else "")
 
 
+def normalize_transcript_text(text: str) -> str:
+    """Normalize layout artifacts without changing any spoken word."""
+    normalized = " ".join(str(text).split())
+    return re.sub(r"\s+([,.;:!?])", r"\1", normalized).strip()
+
+
+def _readable_segments(
+    segments: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    for segment in segments:
+        text = normalize_transcript_text(str(segment.get("text", "")))
+        if not text:
+            continue
+        raw_start = float(segment.get("start", 0.0))
+        raw_end = float(segment.get("end", raw_start))
+        if not math.isfinite(raw_start) or not math.isfinite(raw_end):
+            raise ValueError("Transcript timestamps must be finite")
+        start = max(0.0, raw_start)
+        cleaned.append(
+            {
+                "start": start,
+                "end": max(start, raw_end),
+                "text": text,
+            }
+        )
+    return sorted(cleaned, key=lambda item: (item["start"], item["end"]))
+
+
+def readable_transcript_blocks(
+    segments: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Group ASR fragments into readable, lossless chronological paragraphs."""
+    cleaned = _readable_segments(segments)
+    blocks: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        if not current:
+            return
+        text = normalize_transcript_text(" ".join(item["text"] for item in current))
+        blocks.append(
+            {
+                "section_start": int(
+                    current[0]["start"] // READABLE_SECTION_SECONDS
+                )
+                * READABLE_SECTION_SECONDS,
+                "start": current[0]["start"],
+                "end": current[-1]["end"],
+                "text": text,
+            }
+        )
+        current.clear()
+
+    for segment in cleaned:
+        if current:
+            current_text = normalize_transcript_text(
+                " ".join(item["text"] for item in current)
+            )
+            current_section = int(
+                current[0]["start"] // READABLE_SECTION_SECONDS
+            )
+            next_section = int(segment["start"] // READABLE_SECTION_SECONDS)
+            gap = segment["start"] - current[-1]["end"]
+            projected_chars = len(current_text) + 1 + len(segment["text"])
+            projected_seconds = segment["end"] - current[0]["start"]
+            natural_boundary = (
+                len(current_text) >= READABLE_PARAGRAPH_MIN_CHARS
+                and re.search(r"[.!?][\"')\]]?$", current[-1]["text"])
+                is not None
+            )
+            if (
+                next_section != current_section
+                or gap >= READABLE_PARAGRAPH_GAP_SECONDS
+                or projected_chars > READABLE_PARAGRAPH_MAX_CHARS
+                or projected_seconds > READABLE_PARAGRAPH_MAX_SECONDS
+                or natural_boundary
+            ):
+                flush()
+        current.append(segment)
+    flush()
+    return blocks
+
+
+def normalized_segment_text(segments: Iterable[dict[str, Any]]) -> str:
+    """Return the exact normalized prose represented by readable blocks."""
+    return normalize_transcript_text(
+        " ".join(item["text"] for item in _readable_segments(segments))
+    )
+
+
+def _second_timestamp(seconds: float) -> str:
+    return timestamp(seconds).split(".", 1)[0]
+
+
 def render_transcript_markdown(
     segments: Iterable[dict[str, Any]], *, title: str
 ) -> str:
-    lines = [f"# Transcript — {title}", ""]
-    for segment in segments:
-        text = str(segment.get("text", "")).strip()
-        if text:
-            lines.append(f"- **[{timestamp(segment['start'])}]** {text}")
+    lines = [
+        f"# Transcript — {title}",
+        "",
+        "> Automatically transcribed locally; wording may contain recognition errors.",
+        "",
+    ]
+    active_section: int | None = None
+    for block in readable_transcript_blocks(segments):
+        section_start = int(block["section_start"])
+        if section_start != active_section:
+            if active_section is not None:
+                lines.append("")
+            section_end = section_start + READABLE_SECTION_SECONDS
+            lines.extend(
+                [
+                    f"## {_second_timestamp(section_start)}–"
+                    f"{_second_timestamp(section_end)}",
+                    "",
+                ]
+            )
+            active_section = section_start
+        lines.extend(
+            [
+                f"**[{_second_timestamp(float(block['start']))}]** "
+                f"{block['text']}",
+                "",
+            ]
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 

@@ -27,6 +27,11 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(args.model, "qwen3.6:27b")
 
+    def test_transcript_formats_an_existing_job(self):
+        args = build_parser().parse_args(["transcript", "output/job"])
+        self.assertEqual(args.command, "transcript")
+        self.assertEqual(args.job_dir, Path("output/job"))
+
     def test_only_cli_commands_remain(self):
         parser = build_parser()
         for removed in ("web", "doctor"):

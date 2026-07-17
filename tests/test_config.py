@@ -15,7 +15,8 @@ class ConfigTests(unittest.TestCase):
     def test_summary_has_one_fixed_local_format(self):
         summary = DEFAULT_CONFIG["summary"]
         self.assertEqual(summary["model"], "qwen3.6:27b")
-        self.assertEqual(summary["max_output_tokens"], 8192)
+        self.assertEqual(summary["ollama_url"], "http://127.0.0.1:11435")
+        self.assertEqual(summary["max_output_tokens"], 16384)
         self.assertNotIn("detail_level", summary)
         self.assertNotIn("mode", summary)
         self.assertNotIn("fallback_model", summary)
@@ -34,6 +35,12 @@ class ConfigTests(unittest.TestCase):
         config = copy.deepcopy(DEFAULT_CONFIG)
         config["summary"]["max_output_tokens"] = 4096
         with self.assertRaisesRegex(ValueError, "8192"):
+            validate_config(config)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        config["summary"]["max_output_tokens"] = 8192
+        validate_config(config)
+        config["summary"]["max_output_tokens"] = config["summary"]["context_tokens"]
+        with self.assertRaisesRegex(ValueError, "smaller"):
             validate_config(config)
 
     def test_rejects_invalid_silence_and_video_settings(self):

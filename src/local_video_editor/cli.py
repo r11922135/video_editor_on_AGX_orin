@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from .config import load_config
-from .pipeline import VideoPipeline, resummarize_job
+from .pipeline import VideoPipeline, rerender_transcript_job, resummarize_job
 
 
 def _common_process_args(parser: argparse.ArgumentParser) -> None:
@@ -42,6 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     summarize.add_argument("job_dir", type=Path)
     summarize.add_argument("--config", type=Path)
     summarize.add_argument("--model")
+
+    transcript = sub.add_parser(
+        "transcript",
+        help="Rebuild readable transcript.md from an existing transcript.json",
+    )
+    transcript.add_argument("job_dir", type=Path)
     return parser
 
 
@@ -49,6 +55,11 @@ def main(argv: list[str] | None = None) -> int:
     os.umask(0o077)
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "transcript":
+            result = rerender_transcript_job(args.job_dir)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+
         config = load_config(getattr(args, "config", None))
         if args.command in {"plan", "process"}:
             pipeline = VideoPipeline(config, model_cache=args.model_cache)

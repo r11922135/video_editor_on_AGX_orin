@@ -18,6 +18,7 @@ from local_video_editor.pipeline import (  # noqa: E402
     _config_fingerprint,
     _mark_manifest_failed,
     _pipeline_lock,
+    rerender_transcript_job,
     resummarize_job,
 )
 from local_video_editor.summary import SummaryError  # noqa: E402
@@ -76,7 +77,7 @@ class PipelineTests(unittest.TestCase):
             ) as extract, patch(
                 "local_video_editor.pipeline.transcribe_faster_whisper"
             ) as transcribe, patch(
-                "local_video_editor.pipeline.summarize_oneshot"
+                "local_video_editor.pipeline.summarize_two_stage"
             ) as summarize:
                 result = VideoPipeline(
                     copy.deepcopy(DEFAULT_CONFIG), model_cache=root / "models"
@@ -110,21 +111,42 @@ class PipelineTests(unittest.TestCase):
             )
             metrics = {
                 "model": "test-model",
-                "mode": "oneshot",
+                "mode": "two_stage",
                 "post_generation_content_modified": False,
             }
+
+            def fake_summarize(*_args, **kwargs):
+                kwargs["english_raw_response_path"].write_text("english raw")
+                kwargs["translation_raw_response_path"].write_text("chinese raw")
+                return SUMMARY, metrics
+
             with patch(
-                "local_video_editor.pipeline.summarize_oneshot",
-                return_value=(SUMMARY, metrics),
+                "local_video_editor.pipeline.summarize_two_stage",
+                side_effect=fake_summarize,
             ) as summarize:
                 result = resummarize_job(job, copy.deepcopy(DEFAULT_CONFIG))
             self.assertEqual(result["model"], "test-model")
             self.assertNotIn("detail_level", summarize.call_args.kwargs)
             self.assertNotIn("fallback_model", summarize.call_args.kwargs)
+            self.assertEqual(
+                summarize.call_args.kwargs["max_output_tokens"], 16384
+            )
+            self.assertEqual(
+                summarize.call_args.kwargs["english_raw_response_path"],
+                job / ".summary.pending" / "summary.en.raw.txt",
+            )
+            self.assertEqual(
+                summarize.call_args.kwargs["translation_raw_response_path"],
+                job / ".summary.pending" / "summary.zh-TW.raw.txt",
+            )
             updated = json.loads((job / "manifest.json").read_text())
             self.assertEqual(updated["status"], "complete")
             self.assertTrue((job / "summary.en.md").is_file())
             self.assertTrue((job / "summary.zh-TW.md").is_file())
+            self.assertTrue((job / "summary.en.raw.txt").is_file())
+            self.assertTrue((job / "summary.zh-TW.raw.txt").is_file())
+            self.assertFalse((job / ".summary.pending").exists())
+            self.assertEqual(updated["outputs"]["summary_json"], "summary.json")
 
     def test_resummarize_failure_is_recorded(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -134,6 +156,8 @@ class PipelineTests(unittest.TestCase):
             (job / "transcript.json").write_text(
                 json.dumps({"segments": [{"start": 0, "end": 1, "text": "Training"}]})
             )
+            (job / "summary.en.raw.txt").write_text("previous english")
+            (job / "summary.zh-TW.raw.txt").write_text("previous chinese")
             (job / "manifest.json").write_text(
                 json.dumps({
                     "source": {"name": "training.mp4"},
@@ -142,7 +166,7 @@ class PipelineTests(unittest.TestCase):
                 })
             )
             with patch(
-                "local_video_editor.pipeline.summarize_oneshot",
+                "local_video_editor.pipeline.summarize_two_stage",
                 side_effect=SummaryError("bad model output"),
             ):
                 with self.assertRaisesRegex(SummaryError, "bad model output"):
@@ -150,6 +174,13 @@ class PipelineTests(unittest.TestCase):
             updated = json.loads((job / "manifest.json").read_text())
             self.assertEqual(updated["status"], "failed")
             self.assertTrue((job / "failure.traceback.log").is_file())
+            self.assertFalse((job / ".summary.pending").exists())
+            self.assertEqual(
+                (job / "summary.en.raw.txt").read_text(), "previous english"
+            )
+            self.assertEqual(
+                (job / "summary.zh-TW.raw.txt").read_text(), "previous chinese"
+            )
 
     def test_marks_running_stage_failed(self):
         manifest = {
@@ -159,6 +190,54 @@ class PipelineTests(unittest.TestCase):
         _mark_manifest_failed(manifest, SummaryError("invalid summary"))
         self.assertEqual(manifest["status"], "failed")
         self.assertEqual(manifest["stages"]["summary"]["state"], "failed")
+
+    def test_rerender_transcript_uses_existing_segments_only(self):
+        with tempfile.TemporaryDirectory() as raw:
+            job = Path(raw) / "job"
+            job.mkdir()
+            original = {
+                "segments": [
+                    {"start": 1.0, "end": 2.0, "text": "First fragment."},
+                    {"start": 2.1, "end": 3.0, "text": "Second fragment."},
+                ]
+            }
+            transcript_json = json.dumps(original)
+            (job / "transcript.json").write_text(transcript_json)
+            (job / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "source": {"name": "training.mp4"},
+                        "status": "failed",
+                        "outputs": {"summary_en": "/existing/summary.en.md"},
+                    }
+                )
+            )
+
+            with patch(
+                "local_video_editor.pipeline.transcribe_faster_whisper"
+            ) as transcribe, patch(
+                "local_video_editor.pipeline.summarize_two_stage"
+            ) as summarize:
+                result = rerender_transcript_job(job)
+
+            transcribe.assert_not_called()
+            summarize.assert_not_called()
+
+            self.assertEqual(
+                (job / "transcript.json").read_text(), transcript_json
+            )
+            rendered = (job / "transcript.md").read_text()
+            self.assertIn("First fragment.", rendered)
+            self.assertIn("Second fragment.", rendered)
+            self.assertEqual(result["segment_count"], 2)
+            manifest = json.loads((job / "manifest.json").read_text())
+            self.assertEqual(
+                manifest["outputs"]["transcript_md"], "transcript.md"
+            )
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(
+                manifest["outputs"]["summary_en"], "/existing/summary.en.md"
+            )
 
 
 if __name__ == "__main__":
