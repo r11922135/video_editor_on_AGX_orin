@@ -1,0 +1,27 @@
+{
+  "silence": {
+    "noise_db": -35.0,
+    "min_silence": 1.2,
+    "target_silence": 0.35
+  },
+  "video": {
+    "codec": "libx264",
+    "preset": "veryfast",
+    "crf": 20,
+    "audio_bitrate": "160k"
+  },
+  "asr": {
+    "backend": "faster-whisper",
+    "model": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    "device": "cuda",
+    "compute_type": "float16",
+    "language": "en",
+    "beam_size": 5
+  },
+  "summary": {
+    "ollama_url": "http://127.0.0.1:11434",
+    "model": "qwen3.6:27b",
+    "context_tokens": 65536,
+    "max_output_tokens": 8192
+  }
+}

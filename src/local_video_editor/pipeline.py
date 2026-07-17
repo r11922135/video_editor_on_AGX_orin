@@ -1,0 +1,567 @@
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import shutil
+import traceback
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from functools import wraps
+from pathlib import Path
+from typing import Any, Callable, Iterator
+
+from .asr import transcribe_faster_whisper
+from .io_utils import (
+    atomic_write_json,
+    atomic_write_text,
+    read_json,
+    safe_stem,
+    source_fingerprint,
+)
+from .media import (
+    detect_silences,
+    extract_analysis_audio,
+    media_duration,
+    probe_media,
+    render_video,
+)
+from .silence import SilenceConfig, build_edit_plan
+from .summary import summarize_oneshot, write_summary_files
+from .transcript import write_transcript_files
+
+
+StatusCallback = Callable[[str, str], None]
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class PipelineError(RuntimeError):
+    pass
+
+
+def _config_fingerprint(config: dict[str, Any], operation: str = "full") -> str:
+    relevant = (
+        {"silence": config["silence"], "video": config["video"]}
+        if operation in {"plan", "edit_only"}
+        else config
+    )
+    encoded = json.dumps(
+        {"operation": operation, "config": relevant},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+@contextmanager
+def _pipeline_lock(output_root: Path) -> Iterator[None]:
+    output_root.mkdir(parents=True, exist_ok=True)
+    lock_path = output_root / ".pipeline.lock"
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        lock_path.chmod(0o600)
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise PipelineError(
+                f"Another video/summary job is already using {output_root}"
+            ) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _serialized_pipeline(function):
+    @wraps(function)
+    def wrapper(self, source: Path, *, output_root: Path, **kwargs: Any):
+        resolved_output = output_root.expanduser().resolve()
+        with _pipeline_lock(resolved_output):
+            return function(
+                self, source, output_root=resolved_output, **kwargs
+            )
+
+    return wrapper
+
+
+_GENERATED_JOB_FILES = (
+    "analysis.wav",
+    "audio_extract.log",
+    "edit_plan.json",
+    "edited.mp4",
+    "edited_probe.json",
+    "failure.traceback.log",
+    "ffmpeg_filter.txt",
+    "manifest.json",
+    "probe.json",
+    "render.log",
+    "silencedetect.log",
+    "summary.en.md",
+    "summary.json",
+    "summary.metrics.json",
+    "summary.raw.txt",
+    "summary.zh-TW.md",
+    "transcript.json",
+    "transcript.md",
+    "transcript.srt",
+)
+
+
+def _clear_generated_job_files(job_dir: Path) -> None:
+    for name in _GENERATED_JOB_FILES:
+        (job_dir / name).unlink(missing_ok=True)
+
+
+def _default_status(stage: str, message: str) -> None:
+    print(f"[{stage}] {message}", flush=True)
+
+
+def _mark_manifest_failed(manifest: dict[str, Any], exc: Exception) -> None:
+    now = _utc_now()
+    error = {"type": type(exc).__name__, "message": str(exc)}
+    stages = manifest.setdefault("stages", {})
+    for stage in stages.values():
+        if isinstance(stage, dict) and stage.get("state") == "running":
+            stage.update(
+                {
+                    "state": "failed",
+                    "updated_at": now,
+                    "message": str(exc),
+                    "error": error,
+                }
+            )
+    manifest["status"] = "failed"
+    manifest["updated_at"] = now
+    manifest["failed_at"] = now
+    manifest["error"] = error
+
+
+class VideoPipeline:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        *,
+        model_cache: Path,
+        status: StatusCallback | None = None,
+    ) -> None:
+        self.config = config
+        self.model_cache = model_cache
+        self.status = status or _default_status
+
+    def _stage(
+        self,
+        manifest: dict[str, Any],
+        manifest_path: Path,
+        stage: str,
+        state: str,
+        message: str,
+        **details: Any,
+    ) -> None:
+        manifest.setdefault("stages", {})[stage] = {
+            "state": state,
+            "updated_at": _utc_now(),
+            "message": message,
+            **details,
+        }
+        manifest["updated_at"] = _utc_now()
+        atomic_write_json(manifest_path, manifest)
+        self.status(stage, message)
+
+    @_serialized_pipeline
+    def run(
+        self,
+        source: Path,
+        *,
+        output_root: Path,
+        plan_only: bool = False,
+        edit_only: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        if plan_only and edit_only:
+            raise PipelineError("plan_only and edit_only cannot be used together")
+        source = source.expanduser().resolve(strict=True)
+        if not source.is_file():
+            raise PipelineError(f"Input is not a file: {source}")
+        fingerprint = source_fingerprint(source)
+        operation = "plan" if plan_only else "edit_only" if edit_only else "full"
+        config_fingerprint = _config_fingerprint(self.config, operation)
+        job_id = (
+            f"{safe_stem(source)}-{fingerprint[:10]}-{config_fingerprint[:8]}"
+        )
+        job_dir = output_root / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        job_dir.chmod(0o700)
+        manifest_path = job_dir / "manifest.json"
+        failure_log = job_dir / "failure.traceback.log"
+
+        if manifest_path.exists() and not force:
+            old = read_json(manifest_path)
+            if old.get("source", {}).get("fingerprint") != fingerprint:
+                raise PipelineError("Existing job fingerprint does not match the source")
+            old_status = str(old.get("status", "unknown"))
+            terminal_status = "planned" if plan_only else "complete"
+            if old_status == terminal_status:
+                self.status("cached", f"Using existing job: {job_dir}")
+                return {"job_id": job_id, "job_dir": str(job_dir), "manifest": old}
+            raise PipelineError(
+                f"Existing job is {old_status}; use --force to replace it: {job_dir}"
+            )
+        if force:
+            _clear_generated_job_files(job_dir)
+        failure_log.unlink(missing_ok=True)
+        manifest: dict[str, Any] = {
+            "schema_version": 2,
+            "job_id": job_id,
+            "created_at": _utc_now(),
+            "updated_at": _utc_now(),
+            "source": {
+                "path": str(source),
+                "name": source.name,
+                "size": source.stat().st_size,
+                "mtime_ns": source.stat().st_mtime_ns,
+                "fingerprint": fingerprint,
+                "config_fingerprint": config_fingerprint,
+            },
+            "operation": operation,
+            "config": self.config,
+            "stages": {},
+            "status": "running",
+        }
+        atomic_write_json(manifest_path, manifest)
+
+        try:
+            probe_path = job_dir / "probe.json"
+            self._stage(manifest, manifest_path, "probe", "running", "Inspecting media")
+            probe = probe_media(source)
+            atomic_write_json(probe_path, probe)
+            duration = media_duration(probe)
+            self._stage(
+                manifest,
+                manifest_path,
+                "probe",
+                "complete",
+                f"Media duration: {duration:.2f}s",
+                duration=duration,
+            )
+
+            if not plan_only:
+                free_bytes = shutil.disk_usage(job_dir).free
+                analysis_wav_bytes = 0 if edit_only else int(duration * 32_000)
+                estimated_required = max(
+                    5 * 1024**3,
+                    source.stat().st_size * 2 + analysis_wav_bytes,
+                )
+                if free_bytes < estimated_required:
+                    raise PipelineError(
+                        f"Insufficient free disk: need an estimated "
+                        f"{estimated_required / 1024**3:.1f} GiB but only "
+                        f"{free_bytes / 1024**3:.1f} GiB is available"
+                    )
+                self._stage(
+                    manifest,
+                    manifest_path,
+                    "storage",
+                    "complete",
+                    f"Disk preflight passed ({free_bytes / 1024**3:.1f} GiB free)",
+                    free_bytes=free_bytes,
+                    estimated_required_bytes=estimated_required,
+                )
+
+            silence_cfg_raw = self.config["silence"]
+            silence_cfg = SilenceConfig(
+                min_silence=float(silence_cfg_raw["min_silence"]),
+                target_silence=float(silence_cfg_raw["target_silence"]),
+            )
+            self._stage(
+                manifest,
+                manifest_path,
+                "silence",
+                "running",
+                "Detecting and planning long-silence compression",
+            )
+            detected = detect_silences(
+                source,
+                duration=duration,
+                noise_db=float(silence_cfg_raw["noise_db"]),
+                min_silence=silence_cfg.min_silence,
+                log_path=job_dir / "silencedetect.log",
+            )
+            plan = build_edit_plan(duration, detected, silence_cfg)
+            plan_payload = plan.as_dict()
+            atomic_write_json(job_dir / "edit_plan.json", plan_payload)
+            self._stage(
+                manifest,
+                manifest_path,
+                "silence",
+                "complete",
+                f"Will remove {plan.removed_duration:.2f}s across "
+                f"{len(plan.remove_intervals)} long pauses",
+                detected_count=len(detected),
+                cut_count=len(plan.remove_intervals),
+                removed_duration=plan.removed_duration,
+                output_duration=plan.output_duration,
+            )
+
+            if plan_only:
+                manifest["status"] = "planned"
+                manifest["completed_at"] = _utc_now()
+                atomic_write_json(manifest_path, manifest)
+                return {"job_id": job_id, "job_dir": str(job_dir), "manifest": manifest}
+
+            edited_video = job_dir / "edited.mp4"
+            self._stage(
+                manifest,
+                manifest_path,
+                "render",
+                "running",
+                "Rendering edited video (the source file is never modified)",
+            )
+            render_video(
+                source,
+                edited_video,
+                plan.keep_intervals,
+                source_duration=duration,
+                filter_script_path=job_dir / "ffmpeg_filter.txt",
+                log_path=job_dir / "render.log",
+                codec=str(self.config["video"]["codec"]),
+                preset=str(self.config["video"]["preset"]),
+                crf=int(self.config["video"]["crf"]),
+                audio_bitrate=str(self.config["video"]["audio_bitrate"]),
+            )
+            edited_probe = probe_media(edited_video)
+            atomic_write_json(job_dir / "edited_probe.json", edited_probe)
+            self._stage(
+                manifest,
+                manifest_path,
+                "render",
+                "complete",
+                f"Edited video ready: {edited_video.name}",
+                output=str(edited_video),
+                duration=media_duration(edited_probe),
+                size=edited_video.stat().st_size,
+            )
+
+            if edit_only:
+                manifest["status"] = "complete"
+                manifest["completed_at"] = _utc_now()
+                manifest["outputs"] = {"video": str(edited_video)}
+                atomic_write_json(manifest_path, manifest)
+                failure_log.unlink(missing_ok=True)
+                self.status("complete", f"Edit-only job completed: {job_dir}")
+                return {"job_id": job_id, "job_dir": str(job_dir), "manifest": manifest}
+
+            analysis_audio = job_dir / "analysis.wav"
+            self._stage(
+                manifest,
+                manifest_path,
+                "audio",
+                "running",
+                "Extracting 16kHz mono audio for local ASR",
+            )
+            extract_analysis_audio(
+                edited_video, analysis_audio, job_dir / "audio_extract.log"
+            )
+            self._stage(
+                manifest,
+                manifest_path,
+                "audio",
+                "complete",
+                "Analysis audio ready",
+                size=analysis_audio.stat().st_size,
+            )
+
+            asr_cfg = self.config["asr"]
+            if str(asr_cfg.get("backend")) != "faster-whisper":
+                raise PipelineError(
+                    f"Unsupported ASR backend: {asr_cfg.get('backend')}"
+                )
+            self._stage(
+                manifest,
+                manifest_path,
+                "asr",
+                "running",
+                f"Transcribing locally with {asr_cfg['model']}",
+            )
+            transcription = transcribe_faster_whisper(
+                analysis_audio,
+                model_name=str(asr_cfg["model"]),
+                model_cache=self.model_cache,
+                device=str(asr_cfg["device"]),
+                compute_type=str(asr_cfg["compute_type"]),
+                language=str(asr_cfg["language"]),
+                beam_size=int(asr_cfg["beam_size"]),
+            )
+            atomic_write_json(job_dir / "transcript.json", transcription)
+            segments = transcription["segments"]
+            write_transcript_files(segments, title=source.stem, output_dir=job_dir)
+            self._stage(
+                manifest,
+                manifest_path,
+                "asr",
+                "complete",
+                f"Transcribed {len(segments)} timestamped segments",
+                segment_count=len(segments),
+                language=transcription.get("language"),
+                elapsed_seconds=transcription.get("elapsed_seconds"),
+            )
+
+            if not segments:
+                raise PipelineError(
+                    "ASR detected no speech; refusing to generate a summary from only the filename"
+                )
+
+            summary_cfg = self.config["summary"]
+            self._stage(
+                manifest,
+                manifest_path,
+                "summary",
+                "running",
+                f"Detailed bilingual overview with {summary_cfg['model']}",
+            )
+            summary, metrics = summarize_oneshot(
+                segments,
+                source_title=source.stem,
+                ollama_url=str(summary_cfg["ollama_url"]),
+                model=str(summary_cfg["model"]),
+                context_tokens=int(summary_cfg["context_tokens"]),
+                max_output_tokens=int(summary_cfg["max_output_tokens"]),
+                raw_response_path=job_dir / "summary.raw.txt",
+            )
+            write_summary_files(
+                summary,
+                metrics,
+                source_name=source.name,
+                output_dir=job_dir,
+            )
+            self._stage(
+                manifest,
+                manifest_path,
+                "summary",
+                "complete",
+                f"Bilingual Markdown overview ready ({metrics['model']})",
+                **metrics,
+            )
+
+            analysis_audio.unlink(missing_ok=True)
+            manifest["status"] = "complete"
+            manifest["completed_at"] = _utc_now()
+            manifest["outputs"] = {
+                "video": str(edited_video),
+                "transcript_json": str(job_dir / "transcript.json"),
+                "transcript_srt": str(job_dir / "transcript.srt"),
+                "summary_en": str(job_dir / "summary.en.md"),
+                "summary_zh_tw": str(job_dir / "summary.zh-TW.md"),
+            }
+            atomic_write_json(manifest_path, manifest)
+            failure_log.unlink(missing_ok=True)
+            self.status("complete", f"Job completed: {job_dir}")
+            return {"job_id": job_id, "job_dir": str(job_dir), "manifest": manifest}
+        except Exception as exc:
+            _mark_manifest_failed(manifest, exc)
+            atomic_write_json(manifest_path, manifest)
+            atomic_write_text(failure_log, traceback.format_exc())
+            self.status("failed", str(exc))
+            raise
+
+
+def _resummarize_job_unlocked(
+    job_dir: Path,
+    config: dict[str, Any],
+    *,
+    model: str | None = None,
+) -> dict[str, Any]:
+    job_dir = job_dir.expanduser().resolve(strict=True)
+    transcript_path = job_dir / "transcript.json"
+    manifest_path = job_dir / "manifest.json"
+    if not transcript_path.is_file() or not manifest_path.is_file():
+        raise PipelineError("Job must contain transcript.json and manifest.json")
+    transcript = read_json(transcript_path)
+    manifest = read_json(manifest_path)
+    segments = transcript.get("segments", [])
+    if not segments:
+        raise PipelineError("Transcript has no speech segments to summarize")
+    raw_response_path = job_dir / "summary.raw.txt"
+    summary_cfg = dict(config["summary"])
+    if model:
+        summary_cfg["model"] = model
+    failure_log = job_dir / "failure.traceback.log"
+    now = _utc_now()
+    manifest["status"] = "running"
+    manifest["updated_at"] = now
+    summary_message = f"Detailed bilingual overview with {summary_cfg['model']}"
+    manifest.setdefault("stages", {})["summary"] = {
+        "state": "running",
+        "updated_at": now,
+        "message": summary_message,
+    }
+    atomic_write_json(manifest_path, manifest)
+    try:
+        source_title = Path(manifest["source"]["name"]).stem
+        summary, metrics = summarize_oneshot(
+            segments,
+            source_title=source_title,
+            ollama_url=str(summary_cfg["ollama_url"]),
+            model=str(summary_cfg["model"]),
+            context_tokens=int(summary_cfg["context_tokens"]),
+            max_output_tokens=int(summary_cfg["max_output_tokens"]),
+            raw_response_path=raw_response_path,
+        )
+        write_summary_files(
+            summary,
+            metrics,
+            source_name=str(manifest["source"]["name"]),
+            output_dir=job_dir,
+        )
+        now = _utc_now()
+        manifest.setdefault("stages", {})["summary"] = {
+            "state": "complete",
+            "updated_at": now,
+            "message": f"Bilingual Markdown overview ready ({metrics['model']})",
+            **metrics,
+        }
+        outputs = manifest.setdefault("outputs", {})
+        for key, path in {
+            "video": job_dir / "edited.mp4",
+            "transcript_json": job_dir / "transcript.json",
+            "transcript_srt": job_dir / "transcript.srt",
+        }.items():
+            if path.is_file():
+                outputs[key] = str(path)
+        outputs.update(
+            {
+                "summary_en": str(job_dir / "summary.en.md"),
+                "summary_zh_tw": str(job_dir / "summary.zh-TW.md"),
+            }
+        )
+        if (job_dir / "edited.mp4").is_file():
+            manifest["status"] = "complete"
+            manifest["completed_at"] = now
+        manifest.pop("failed_at", None)
+        manifest.pop("error", None)
+        manifest["updated_at"] = now
+        atomic_write_json(manifest_path, manifest)
+        failure_log.unlink(missing_ok=True)
+        return metrics
+    except Exception as exc:
+        _mark_manifest_failed(manifest, exc)
+        atomic_write_json(manifest_path, manifest)
+        atomic_write_text(failure_log, traceback.format_exc())
+        raise
+
+
+def resummarize_job(
+    job_dir: Path,
+    config: dict[str, Any],
+    *,
+    model: str | None = None,
+) -> dict[str, Any]:
+    resolved = job_dir.expanduser().resolve(strict=True)
+    with _pipeline_lock(resolved.parent):
+        return _resummarize_job_unlocked(
+            resolved,
+            config,
+            model=model,
+        )

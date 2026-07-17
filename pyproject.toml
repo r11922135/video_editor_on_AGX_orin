@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orin-local-video-editor"
+version = "0.1.0"
+description = "CLI-only local video editing, transcription, and bilingual overview for Jetson"
+requires-python = ">=3.10"
+license = {text = "Proprietary - internal use"}
+
+[project.optional-dependencies]
+asr = ["faster-whisper==1.2.1"]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+orin-video-editor = "local_video_editor.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
