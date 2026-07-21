@@ -12,16 +12,78 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from local_video_editor.media import (  # noqa: E402
+    burn_ass_subtitles,
     detect_silences,
     media_duration,
     probe_media,
     render_video,
 )
 from local_video_editor.silence import Interval, SilenceConfig, build_edit_plan  # noqa: E402
+from local_video_editor.subtitles import render_ass  # noqa: E402
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")
 class MediaIntegrationTests(unittest.TestCase):
+    def test_burned_ass_keeps_audio_and_duration(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "edited.mp4"
+            subprocess.run(
+                [
+                    os.environ.get("FFMPEG_BIN", "ffmpeg"),
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=blue:s=320x180:r=10:d=2",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=48000:duration=2",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                    str(source),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            ass = root / "subtitle.ass"
+            ass.write_text(
+                render_ass([{"start": 0.2, "end": 1.8, "text": "Local subtitle"}]),
+                encoding="utf-8",
+            )
+            output = root / "subtitled.mp4"
+            burn_ass_subtitles(
+                source,
+                ass,
+                output,
+                root / "subtitle.render.log",
+                preset="ultrafast",
+            )
+
+            source_probe = probe_media(source)
+            output_probe = probe_media(output)
+            source_audio = next(
+                stream for stream in source_probe["streams"] if stream["codec_type"] == "audio"
+            )
+            output_audio = next(
+                stream for stream in output_probe["streams"] if stream["codec_type"] == "audio"
+            )
+            self.assertEqual(output_audio["codec_name"], source_audio["codec_name"])
+            self.assertAlmostEqual(
+                media_duration(output_probe), media_duration(source_probe), delta=0.1
+            )
+            self.assertTrue((root / "subtitle.render.log").is_file())
+
     def test_detect_plan_and_render_synthetic_video(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

@@ -21,7 +21,10 @@ def _common_process_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="orin-video-editor",
-        description="Local silence editing, GPU transcription, and bilingual overview",
+        description=(
+            "Local silence editing, GPU transcription, bilingual overview, and "
+            "optional burned subtitles"
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -30,10 +33,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     process = sub.add_parser("process", help="Run the complete local pipeline")
     _common_process_args(process)
-    process.add_argument(
+    process_mode = process.add_mutually_exclusive_group()
+    process_mode.add_argument(
         "--edit-only",
         action="store_true",
         help="Only create edited.mp4; skip audio extraction, ASR, and summary",
+    )
+    process_mode.add_argument(
+        "--subtitles",
+        action="store_true",
+        help="Also correct, align, and burn best-effort English subtitles",
     )
 
     summarize = sub.add_parser(
@@ -68,6 +77,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_root=args.output_root,
                 plan_only=args.command == "plan",
                 edit_only=getattr(args, "edit_only", False),
+                subtitles=getattr(args, "subtitles", False),
                 force=args.force,
             )
             print(

@@ -276,3 +276,72 @@ def extract_analysis_audio(source: Path, output_wav: Path, log_path: Path) -> No
     partial.chmod(0o600)
     output_wav.unlink(missing_ok=True)
     partial.replace(output_wav)
+
+
+def burn_ass_subtitles(
+    source: Path,
+    ass_path: Path,
+    output: Path,
+    log_path: Path,
+    *,
+    codec: str = "libx264",
+    preset: str = "veryfast",
+    crf: int = 20,
+) -> None:
+    """Burn an ASS file while stream-copying audio and publishing atomically."""
+    require_media_tools()
+    source = source.resolve(strict=True)
+    ass_path = ass_path.resolve(strict=True)
+    output = output.resolve()
+    if source.parent != ass_path.parent or source.parent != output.parent:
+        raise MediaError("Subtitle burn inputs and output must share one job directory")
+
+    partial = _partial_media_path(output)
+    partial.unlink(missing_ok=True)
+    command = [
+        _media_binary("ffmpeg"),
+        "-hide_banner",
+        "-nostdin",
+        "-y",
+        "-i",
+        source.name,
+        "-vf",
+        f"ass={ass_path.name}",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-map_metadata",
+        "0",
+        "-c:v",
+        codec,
+        "-preset",
+        preset,
+        "-crf",
+        str(int(crf)),
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        partial.name,
+    ]
+    result = subprocess.run(
+        command,
+        cwd=source.parent,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    atomic_write_text(
+        log_path,
+        f"$ {_command_text(command)}\n\nSTDOUT\n{result.stdout}\n\n"
+        f"STDERR\n{result.stderr}",
+    )
+    if result.returncode != 0 or not partial.is_file() or partial.stat().st_size == 0:
+        partial.unlink(missing_ok=True)
+        raise MediaError(f"FFmpeg subtitle burn failed; see {log_path}")
+    partial.chmod(0o600)
+    output.unlink(missing_ok=True)
+    partial.replace(output)

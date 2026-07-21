@@ -23,5 +23,12 @@
     "model": "qwen3.6:27b",
     "context_tokens": 65536,
     "max_output_tokens": 16384
+  },
+  "subtitles": {
+    "aligner_model": "Qwen/Qwen3-ForcedAligner-0.6B",
+    "correction_context_tokens": 24576,
+    "correction_output_tokens": 512,
+    "correction_max_rules": 10,
+    "alignment_chunk_seconds": 120
   }
 }

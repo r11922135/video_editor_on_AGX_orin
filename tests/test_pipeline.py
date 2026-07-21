@@ -31,6 +31,79 @@ SUMMARY = {
 
 
 class PipelineTests(unittest.TestCase):
+    def _run_mocked_full_pipeline(self, root, subtitle_effect):
+        source = root / "training.mp4"
+        source.write_bytes(b"source-video")
+        original_segments = [
+            {
+                "id": 0,
+                "start": 0.0,
+                "end": 2.0,
+                "text": "The CubeBars motor uses ROS.",
+                "words": [
+                    {"start": 0.0, "end": 0.4, "word": "The"},
+                    {"start": 0.4, "end": 1.0, "word": "CubeBars"},
+                    {"start": 1.0, "end": 1.3, "word": "motor"},
+                    {"start": 1.3, "end": 1.6, "word": "uses"},
+                    {"start": 1.6, "end": 2.0, "word": "ROS."},
+                ],
+            }
+        ]
+        probe = {"format": {"duration": "10.0"}}
+        observed = {}
+
+        def fake_render(_source, output, *_args, **_kwargs):
+            output.write_bytes(b"edited-video")
+
+        def fake_extract(_video, output, _log):
+            output.write_bytes(b"analysis-audio")
+
+        def fake_summarize(segments, **kwargs):
+            observed["summary_reference"] = segments
+            observed["summary_snapshot"] = copy.deepcopy(segments)
+            kwargs["english_raw_response_path"].write_text("english raw")
+            kwargs["translation_raw_response_path"].write_text("chinese raw")
+            return SUMMARY, {
+                "model": "test-model",
+                "mode": "two_stage",
+                "post_generation_content_modified": False,
+            }
+
+        def fake_subtitles(**kwargs):
+            observed["subtitle_snapshot"] = copy.deepcopy(kwargs["segments"])
+            return subtitle_effect(kwargs)
+
+        transcription = {
+            "segments": copy.deepcopy(original_segments),
+            "language": "en",
+            "elapsed_seconds": 0.1,
+        }
+        with patch(
+            "local_video_editor.pipeline.probe_media", return_value=probe
+        ), patch(
+            "local_video_editor.pipeline.detect_silences", return_value=[]
+        ), patch(
+            "local_video_editor.pipeline.render_video", side_effect=fake_render
+        ), patch(
+            "local_video_editor.pipeline.extract_analysis_audio",
+            side_effect=fake_extract,
+        ), patch(
+            "local_video_editor.pipeline.transcribe_faster_whisper",
+            return_value=transcription,
+        ), patch(
+            "local_video_editor.pipeline.summarize_two_stage",
+            side_effect=fake_summarize,
+        ), patch(
+            "local_video_editor.pipeline.create_subtitled_video",
+            side_effect=fake_subtitles,
+        ):
+            result = VideoPipeline(
+                copy.deepcopy(DEFAULT_CONFIG),
+                model_cache=root / "models",
+                status=lambda *_args: None,
+            ).run(source, output_root=root / "output", subtitles=True)
+        return result, original_segments, observed
+
     def test_operation_is_part_of_job_identity(self):
         config = copy.deepcopy(DEFAULT_CONFIG)
         self.assertNotEqual(
@@ -47,6 +120,107 @@ class PipelineTests(unittest.TestCase):
             _config_fingerprint(config, "full"),
             _config_fingerprint(changed, "full"),
         )
+
+    def test_subtitles_are_part_of_full_job_identity(self):
+        config = copy.deepcopy(DEFAULT_CONFIG)
+        self.assertNotEqual(
+            _config_fingerprint(config, "full", subtitles=False),
+            _config_fingerprint(config, "full", subtitles=True),
+        )
+        changed = copy.deepcopy(config)
+        changed["subtitles"]["alignment_chunk_seconds"] = 90
+        self.assertEqual(
+            _config_fingerprint(config, "full", subtitles=False),
+            _config_fingerprint(changed, "full", subtitles=False),
+        )
+        self.assertNotEqual(
+            _config_fingerprint(config, "full", subtitles=True),
+            _config_fingerprint(changed, "full", subtitles=True),
+        )
+
+    def test_edit_only_and_subtitles_are_mutually_exclusive(self):
+        with tempfile.TemporaryDirectory() as raw:
+            pipeline = VideoPipeline(
+                copy.deepcopy(DEFAULT_CONFIG), model_cache=Path(raw) / "models"
+            )
+            with self.assertRaisesRegex(
+                PipelineError, "--edit-only and --subtitles"
+            ):
+                pipeline.run(
+                    Path(raw) / "does-not-need-to-exist.mp4",
+                    output_root=Path(raw) / "output",
+                    edit_only=True,
+                    subtitles=True,
+                )
+
+    def test_full_subtitle_branch_cannot_mutate_canonical_or_summary_input(self):
+        def mutate_subtitle_input(kwargs):
+            kwargs["segments"][0]["text"] = "MUTATED BY OPTIONAL SUBTITLE BRANCH"
+            kwargs["segments"][0]["words"][0]["word"] = "MUTATED"
+            output_dir = kwargs["output_dir"]
+            (output_dir / "subtitled.mp4").write_bytes(b"subtitled-video")
+            for name in (
+                "subtitle.srt",
+                "subtitle.ass",
+                "subtitle.rules.json",
+                "subtitle.corrected.json",
+                "subtitle.correction.raw.txt",
+            ):
+                (output_dir / name).write_text("test output")
+            return {"cue_count": 1, "fallback_used": False}
+
+        with tempfile.TemporaryDirectory() as raw:
+            result, original_segments, observed = self._run_mocked_full_pipeline(
+                Path(raw), mutate_subtitle_input
+            )
+            transcript = json.loads(
+                (Path(result["job_dir"]) / "transcript.json").read_text()
+            )
+            self.assertEqual(observed["summary_snapshot"], original_segments)
+            self.assertEqual(observed["subtitle_snapshot"], original_segments)
+            self.assertEqual(transcript["segments"], original_segments)
+            self.assertEqual(observed["summary_reference"], original_segments)
+
+    def test_optional_subtitle_failure_keeps_summary_and_completes_job(self):
+        def fail_subtitles(_kwargs):
+            raise RuntimeError("subtitle renderer unavailable")
+
+        with tempfile.TemporaryDirectory() as raw:
+            result, original_segments, observed = self._run_mocked_full_pipeline(
+                Path(raw), fail_subtitles
+            )
+            job = Path(result["job_dir"])
+            manifest = json.loads((job / "manifest.json").read_text())
+
+            self.assertEqual(manifest["status"], "complete")
+            self.assertEqual(manifest["stages"]["summary"]["state"], "complete")
+            self.assertEqual(manifest["stages"]["subtitles"]["state"], "failed")
+            self.assertTrue(manifest["stages"]["subtitles"]["optional"])
+            self.assertEqual(manifest["warnings"][0]["stage"], "subtitles")
+            self.assertEqual(
+                manifest["warnings"][0]["message"], "subtitle renderer unavailable"
+            )
+            self.assertEqual(observed["summary_snapshot"], original_segments)
+            for key in (
+                "summary_en",
+                "summary_zh_tw",
+                "summary_json",
+                "summary_en_raw",
+                "summary_zh_tw_raw",
+                "summary_metrics",
+            ):
+                self.assertIn(key, manifest["outputs"])
+                self.assertTrue((job / manifest["outputs"][key]).is_file())
+            self.assertNotIn("subtitled_video", manifest["outputs"])
+            self.assertTrue((job / "subtitle.error.log").is_file())
+            with self.assertRaisesRegex(PipelineError, "without a valid subtitled"):
+                VideoPipeline(
+                    copy.deepcopy(DEFAULT_CONFIG), model_cache=Path(raw) / "models"
+                ).run(
+                    Path(raw) / "training.mp4",
+                    output_root=Path(raw) / "output",
+                    subtitles=True,
+                )
 
     def test_pipeline_lock_rejects_a_second_job(self):
         with tempfile.TemporaryDirectory() as raw:

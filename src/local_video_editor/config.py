@@ -30,6 +30,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "context_tokens": 65536,
         "max_output_tokens": 16384,
     },
+    "subtitles": {
+        "aligner_model": "Qwen/Qwen3-ForcedAligner-0.6B",
+        "correction_context_tokens": 24576,
+        "correction_output_tokens": 512,
+        "correction_max_rules": 10,
+        "alignment_chunk_seconds": 120,
+    },
 }
 
 
@@ -91,4 +98,23 @@ def validate_config(config: dict[str, Any]) -> None:
     if int(summary["max_output_tokens"]) >= int(summary["context_tokens"]):
         raise ValueError(
             "summary.max_output_tokens must be smaller than summary.context_tokens"
+        )
+    subtitles = config["subtitles"]
+    if not str(subtitles.get("aligner_model", "")).strip():
+        raise ValueError("subtitles.aligner_model must not be empty")
+    correction_context = int(subtitles["correction_context_tokens"])
+    correction_output = int(subtitles["correction_output_tokens"])
+    if not 8192 <= correction_context <= 65536:
+        raise ValueError(
+            "subtitles.correction_context_tokens must be between 8192 and 65536"
+        )
+    if not 128 <= correction_output < correction_context:
+        raise ValueError(
+            "subtitles.correction_output_tokens must be >= 128 and smaller than context"
+        )
+    if not 1 <= int(subtitles["correction_max_rules"]) <= 30:
+        raise ValueError("subtitles.correction_max_rules must be between 1 and 30")
+    if not 30 <= int(subtitles["alignment_chunk_seconds"]) <= 150:
+        raise ValueError(
+            "subtitles.alignment_chunk_seconds must be between 30 and 150"
         )

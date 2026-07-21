@@ -10,7 +10,7 @@ HF_CACHE_DIR="${HF_CACHE_DIR:-${USER_HOME}/.cache/huggingface}"
 usage() {
   cat <<'EOF'
 Usage:
-  ./run_docker.sh process VIDEO [--edit-only] [--config FILE] [--force]
+  ./run_docker.sh process VIDEO [--edit-only | --subtitles] [--config FILE] [--force]
   ./run_docker.sh plan VIDEO [--config FILE] [--force]
   ./run_docker.sh summarize OUTPUT_JOB_DIR [--model MODEL] [--config FILE]
   ./run_docker.sh transcript OUTPUT_JOB_DIR
@@ -35,6 +35,9 @@ common=(
   --volume "${HF_CACHE_DIR}:/data/models/huggingface"
   --env "PYTHONPATH=/workspace/src"
   --env "HOME=/tmp"
+  --env "USER=video-editor"
+  --env "LOGNAME=video-editor"
+  --env "TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor"
   --env "HF_HOME=/data/models/huggingface"
   --env "HUGGINGFACE_HUB_CACHE=/data/models/huggingface/hub"
   --env "FFMPEG_BIN=/usr/bin/ffmpeg"

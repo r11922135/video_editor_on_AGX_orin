@@ -53,6 +53,35 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "crf"):
             validate_config(config)
 
+    def test_subtitle_defaults_are_bounded_for_local_inference(self):
+        subtitles = DEFAULT_CONFIG["subtitles"]
+        self.assertEqual(
+            subtitles["aligner_model"], "Qwen/Qwen3-ForcedAligner-0.6B"
+        )
+        self.assertEqual(subtitles["correction_context_tokens"], 24576)
+        self.assertEqual(subtitles["correction_output_tokens"], 512)
+        self.assertEqual(subtitles["correction_max_rules"], 10)
+        self.assertEqual(subtitles["alignment_chunk_seconds"], 120)
+
+    def test_rejects_invalid_subtitle_settings(self):
+        cases = (
+            ("aligner_model", "", "aligner_model"),
+            ("correction_context_tokens", 8191, "correction_context_tokens"),
+            ("correction_context_tokens", 65537, "correction_context_tokens"),
+            ("correction_output_tokens", 127, "correction_output_tokens"),
+            ("correction_output_tokens", 24576, "correction_output_tokens"),
+            ("correction_max_rules", 0, "correction_max_rules"),
+            ("correction_max_rules", 31, "correction_max_rules"),
+            ("alignment_chunk_seconds", 29, "alignment_chunk_seconds"),
+            ("alignment_chunk_seconds", 151, "alignment_chunk_seconds"),
+        )
+        for key, value, message in cases:
+            with self.subTest(key=key, value=value):
+                config = copy.deepcopy(DEFAULT_CONFIG)
+                config["subtitles"][key] = value
+                with self.assertRaisesRegex(ValueError, message):
+                    validate_config(config)
+
 
 if __name__ == "__main__":
     unittest.main()

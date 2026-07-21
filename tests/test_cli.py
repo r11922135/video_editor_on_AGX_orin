@@ -20,6 +20,20 @@ class CliTests(unittest.TestCase):
     def test_full_process_is_default(self):
         args = build_parser().parse_args(["process", "training.mp4"])
         self.assertFalse(args.edit_only)
+        self.assertFalse(args.subtitles)
+
+    def test_process_supports_burned_subtitles(self):
+        args = build_parser().parse_args(
+            ["process", "training.mp4", "--subtitles"]
+        )
+        self.assertTrue(args.subtitles)
+        self.assertFalse(args.edit_only)
+
+    def test_process_rejects_edit_only_with_subtitles(self):
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                ["process", "training.mp4", "--edit-only", "--subtitles"]
+            )
 
     def test_summarize_supports_model_override(self):
         args = build_parser().parse_args(

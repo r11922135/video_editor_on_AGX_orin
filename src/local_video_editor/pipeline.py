@@ -6,6 +6,7 @@ import json
 import shutil
 import traceback
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -28,11 +29,12 @@ from .media import (
 )
 from .silence import SilenceConfig, build_edit_plan
 from .summary import summarize_two_stage, write_summary_files
+from .subtitles import create_subtitled_video
 from .transcript import render_transcript_markdown, write_transcript_files
 
 
 StatusCallback = Callable[[str, str], None]
-FULL_PIPELINE_REVISION = "cli-two-stage-v3"
+FULL_PIPELINE_REVISION = "cli-two-stage-subtitles-v5"
 
 
 def _utc_now() -> str:
@@ -43,13 +45,23 @@ class PipelineError(RuntimeError):
     pass
 
 
-def _config_fingerprint(config: dict[str, Any], operation: str = "full") -> str:
-    relevant = (
-        {"silence": config["silence"], "video": config["video"]}
-        if operation in {"plan", "edit_only"}
-        else config
-    )
-    identity: dict[str, Any] = {"operation": operation, "config": relevant}
+def _config_fingerprint(
+    config: dict[str, Any],
+    operation: str = "full",
+    *,
+    subtitles: bool = False,
+) -> str:
+    if operation in {"plan", "edit_only"}:
+        relevant = {"silence": config["silence"], "video": config["video"]}
+    else:
+        relevant = dict(config)
+        if not subtitles:
+            relevant.pop("subtitles", None)
+    identity: dict[str, Any] = {
+        "operation": operation,
+        "config": relevant,
+        "subtitles_requested": bool(subtitles),
+    }
     if operation == "full":
         identity["pipeline_revision"] = FULL_PIPELINE_REVISION
     encoded = json.dumps(
@@ -110,6 +122,15 @@ _GENERATED_JOB_FILES = (
     "summary.en.raw.txt",
     "summary.zh-TW.raw.txt",
     "summary.zh-TW.md",
+    "subtitle.ass",
+    "subtitle.corrected.json",
+    "subtitle.correction.raw.txt",
+    "subtitle.error.log",
+    "subtitle.probe.json",
+    "subtitle.render.log",
+    "subtitle.rules.json",
+    "subtitle.srt",
+    "subtitled.mp4",
     "transcript.json",
     "transcript.md",
     "transcript.srt",
@@ -185,16 +206,21 @@ class VideoPipeline:
         output_root: Path,
         plan_only: bool = False,
         edit_only: bool = False,
+        subtitles: bool = False,
         force: bool = False,
     ) -> dict[str, Any]:
         if plan_only and edit_only:
             raise PipelineError("plan_only and edit_only cannot be used together")
+        if edit_only and subtitles:
+            raise PipelineError("--edit-only and --subtitles cannot be used together")
         source = source.expanduser().resolve(strict=True)
         if not source.is_file():
             raise PipelineError(f"Input is not a file: {source}")
         fingerprint = source_fingerprint(source)
         operation = "plan" if plan_only else "edit_only" if edit_only else "full"
-        config_fingerprint = _config_fingerprint(self.config, operation)
+        config_fingerprint = _config_fingerprint(
+            self.config, operation, subtitles=subtitles
+        )
         job_id = (
             f"{safe_stem(source)}-{fingerprint[:10]}-{config_fingerprint[:8]}"
         )
@@ -211,6 +237,15 @@ class VideoPipeline:
             old_status = str(old.get("status", "unknown"))
             terminal_status = "planned" if plan_only else "complete"
             if old_status == terminal_status:
+                if subtitles and (
+                    old.get("stages", {}).get("subtitles", {}).get("state")
+                    != "complete"
+                    or not (job_dir / "subtitled.mp4").is_file()
+                ):
+                    raise PipelineError(
+                        "Existing job completed without a valid subtitled.mp4; "
+                        f"use --force to retry it: {job_dir}"
+                    )
                 self.status("cached", f"Using existing job: {job_dir}")
                 return {"job_id": job_id, "job_dir": str(job_dir), "manifest": old}
             raise PipelineError(
@@ -233,6 +268,7 @@ class VideoPipeline:
                 "config_fingerprint": config_fingerprint,
             },
             "operation": operation,
+            "subtitles_requested": bool(subtitles),
             "config": self.config,
             "stages": {},
             "status": "running",
@@ -257,9 +293,10 @@ class VideoPipeline:
             if not plan_only:
                 free_bytes = shutil.disk_usage(job_dir).free
                 analysis_wav_bytes = 0 if edit_only else int(duration * 32_000)
+                output_multiplier = 3 if subtitles else 2
                 estimated_required = max(
                     5 * 1024**3,
-                    source.stat().st_size * 2 + analysis_wav_bytes,
+                    source.stat().st_size * output_multiplier + analysis_wav_bytes,
                 )
                 if free_bytes < estimated_required:
                     raise PipelineError(
@@ -461,6 +498,101 @@ class VideoPipeline:
                 **metrics,
             )
 
+            subtitle_outputs: dict[str, str] = {}
+            if subtitles:
+                self._stage(
+                    manifest,
+                    manifest_path,
+                    "subtitles",
+                    "running",
+                    "Preparing best-effort corrected and burned subtitles",
+                    optional=True,
+                )
+                try:
+                    subtitle_metrics = create_subtitled_video(
+                        analysis_audio=analysis_audio,
+                        edited_video=edited_video,
+                        segments=deepcopy(segments),
+                        output_dir=job_dir,
+                        summary_config=summary_cfg,
+                        subtitle_config=self.config["subtitles"],
+                        video_config=self.config["video"],
+                        progress=lambda message: self._stage(
+                            manifest,
+                            manifest_path,
+                            "subtitles",
+                            "running",
+                            message,
+                            optional=True,
+                        ),
+                    )
+                    subtitled_video = job_dir / "subtitled.mp4"
+                    subtitle_probe = probe_media(subtitled_video)
+                    subtitle_duration = media_duration(subtitle_probe)
+                    edited_duration = media_duration(edited_probe)
+                    if abs(subtitle_duration - edited_duration) > 1.0:
+                        raise PipelineError(
+                            "Subtitled video duration differs from edited.mp4 by more "
+                            "than one second"
+                        )
+                    atomic_write_json(job_dir / "subtitle.probe.json", subtitle_probe)
+                    subtitle_outputs = {
+                        "subtitled_video": "subtitled.mp4",
+                        "subtitle_srt": "subtitle.srt",
+                        "subtitle_ass": "subtitle.ass",
+                        "subtitle_rules": "subtitle.rules.json",
+                        "subtitle_corrected": "subtitle.corrected.json",
+                        "subtitle_correction_raw": "subtitle.correction.raw.txt",
+                    }
+                    if (job_dir / "subtitle.error.log").is_file():
+                        subtitle_outputs["subtitle_error"] = "subtitle.error.log"
+                    fallback_note = (
+                        " (best-effort fallback used)"
+                        if subtitle_metrics["fallback_used"]
+                        else ""
+                    )
+                    self._stage(
+                        manifest,
+                        manifest_path,
+                        "subtitles",
+                        "complete",
+                        f"Burned {subtitle_metrics['cue_count']} subtitle cues into "
+                        f"subtitled.mp4{fallback_note}",
+                        optional=True,
+                        duration=subtitle_duration,
+                        size=subtitled_video.stat().st_size,
+                        **subtitle_metrics,
+                    )
+                except Exception as exc:
+                    (job_dir / "subtitled.mp4").unlink(missing_ok=True)
+                    (job_dir / "subtitle.probe.json").unlink(missing_ok=True)
+                    error_path = job_dir / "subtitle.error.log"
+                    previous = (
+                        error_path.read_text(encoding="utf-8")
+                        if error_path.is_file()
+                        else ""
+                    )
+                    atomic_write_text(
+                        error_path,
+                        previous + traceback.format_exc(),
+                    )
+                    warning = {
+                        "stage": "subtitles",
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                    manifest.setdefault("warnings", []).append(warning)
+                    self._stage(
+                        manifest,
+                        manifest_path,
+                        "subtitles",
+                        "failed",
+                        f"Optional subtitles failed; edit, transcript, and summary "
+                        f"remain valid: {exc}",
+                        optional=True,
+                        error=warning,
+                    )
+
             analysis_audio.unlink(missing_ok=True)
             manifest["status"] = "complete"
             manifest["completed_at"] = _utc_now()
@@ -475,6 +607,7 @@ class VideoPipeline:
                 "summary_en_raw": "summary.en.raw.txt",
                 "summary_zh_tw_raw": "summary.zh-TW.raw.txt",
                 "summary_metrics": "summary.metrics.json",
+                **subtitle_outputs,
             }
             atomic_write_json(manifest_path, manifest)
             failure_log.unlink(missing_ok=True)
