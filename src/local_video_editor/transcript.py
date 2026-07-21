@@ -245,10 +245,20 @@ def transcript_windows_for_prompt(
 
 
 def write_transcript_files(
-    segments: list[dict[str, Any]], *, title: str, output_dir: Path
+    segments: list[dict[str, Any]],
+    *,
+    title: str,
+    output_dir: Path,
+    filename_prefix: str | None = None,
 ) -> None:
-    atomic_write_text(output_dir / "transcript.srt", render_srt(segments))
+    srt_name = (
+        f"{filename_prefix}_transcript.srt" if filename_prefix else "transcript.srt"
+    )
+    markdown_name = (
+        f"{filename_prefix}_transcript.md" if filename_prefix else "transcript.md"
+    )
+    atomic_write_text(output_dir / srt_name, render_srt(segments))
     atomic_write_text(
-        output_dir / "transcript.md",
+        output_dir / markdown_name,
         render_transcript_markdown(segments, title=title),
     )

@@ -18,6 +18,7 @@ from local_video_editor.pipeline import (  # noqa: E402
     _config_fingerprint,
     _mark_manifest_failed,
     _pipeline_lock,
+    _user_output_names,
     rerender_transcript_job,
     resummarize_job,
 )
@@ -158,16 +159,26 @@ class PipelineTests(unittest.TestCase):
             kwargs["segments"][0]["text"] = "MUTATED BY OPTIONAL SUBTITLE BRANCH"
             kwargs["segments"][0]["words"][0]["word"] = "MUTATED"
             output_dir = kwargs["output_dir"]
-            (output_dir / "subtitled.mp4").write_bytes(b"subtitled-video")
+            prefix = kwargs["filename_prefix"]
+            video_name = f"{prefix}_subtitled.mp4"
+            srt_name = f"{prefix}_subtitle.srt"
+            ass_name = f"{prefix}_subtitle.ass"
+            (output_dir / video_name).write_bytes(b"subtitled-video")
             for name in (
-                "subtitle.srt",
-                "subtitle.ass",
+                srt_name,
+                ass_name,
                 "subtitle.rules.json",
                 "subtitle.corrected.json",
                 "subtitle.correction.raw.txt",
             ):
                 (output_dir / name).write_text("test output")
-            return {"cue_count": 1, "fallback_used": False}
+            return {
+                "output": video_name,
+                "subtitle_srt": srt_name,
+                "subtitle_ass": ass_name,
+                "cue_count": 1,
+                "fallback_used": False,
+            }
 
         with tempfile.TemporaryDirectory() as raw:
             result, original_segments, observed = self._run_mocked_full_pipeline(
@@ -230,6 +241,20 @@ class PipelineTests(unittest.TestCase):
                     with _pipeline_lock(root):
                         pass
 
+    def test_user_output_names_use_robotics_seminar_date(self):
+        names = _user_output_names(
+            "Robotics Seminar-20260715_103245-Meeting Recording.mp4"
+        )
+        self.assertEqual(names["video"], "Robotics_Seminar_20260715_edited.mp4")
+        self.assertEqual(
+            names["summary_zh_tw"],
+            "Robotics_Seminar_20260715_summary.zh-TW.md",
+        )
+        self.assertEqual(
+            names["transcript_md"],
+            "Robotics_Seminar_20260715_transcript.md",
+        )
+
     def test_edit_only_stops_before_audio_asr_and_summary(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -261,7 +286,7 @@ class PipelineTests(unittest.TestCase):
             transcribe.assert_not_called()
             summarize.assert_not_called()
             job = Path(result["job_dir"])
-            self.assertTrue((job / "edited.mp4").is_file())
+            self.assertTrue((job / "training_edited.mp4").is_file())
             self.assertFalse((job / "analysis.wav").exists())
             self.assertFalse((job / "transcript.json").exists())
             self.assertFalse((job / "summary.json").exists())
@@ -315,8 +340,8 @@ class PipelineTests(unittest.TestCase):
             )
             updated = json.loads((job / "manifest.json").read_text())
             self.assertEqual(updated["status"], "complete")
-            self.assertTrue((job / "summary.en.md").is_file())
-            self.assertTrue((job / "summary.zh-TW.md").is_file())
+            self.assertTrue((job / "training_summary.en.md").is_file())
+            self.assertTrue((job / "training_summary.zh-TW.md").is_file())
             self.assertTrue((job / "summary.en.raw.txt").is_file())
             self.assertTrue((job / "summary.zh-TW.raw.txt").is_file())
             self.assertFalse((job / ".summary.pending").exists())
@@ -400,13 +425,13 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(
                 (job / "transcript.json").read_text(), transcript_json
             )
-            rendered = (job / "transcript.md").read_text()
+            rendered = (job / "training_transcript.md").read_text()
             self.assertIn("First fragment.", rendered)
             self.assertIn("Second fragment.", rendered)
             self.assertEqual(result["segment_count"], 2)
             manifest = json.loads((job / "manifest.json").read_text())
             self.assertEqual(
-                manifest["outputs"]["transcript_md"], "transcript.md"
+                manifest["outputs"]["transcript_md"], "training_transcript.md"
             )
             self.assertEqual(manifest["status"], "failed")
             self.assertEqual(

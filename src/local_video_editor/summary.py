@@ -878,18 +878,27 @@ def write_summary_files(
     *,
     source_name: str,
     output_dir: Path,
+    filename_prefix: str | None = None,
 ) -> None:
     model = str(metrics.get("model", "unknown"))
+    english_name = (
+        f"{filename_prefix}_summary.en.md" if filename_prefix else "summary.en.md"
+    )
+    chinese_name = (
+        f"{filename_prefix}_summary.zh-TW.md"
+        if filename_prefix
+        else "summary.zh-TW.md"
+    )
     atomic_write_json(output_dir / "summary.json", summary)
     atomic_write_json(output_dir / "summary.metrics.json", metrics)
     atomic_write_text(
-        output_dir / "summary.en.md",
+        output_dir / english_name,
         render_summary_markdown(
             summary, language="en", source_name=source_name, model=model
         ),
     )
     atomic_write_text(
-        output_dir / "summary.zh-TW.md",
+        output_dir / chinese_name,
         render_summary_markdown(
             summary, language="zh_tw", source_name=source_name, model=model
         ),

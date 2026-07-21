@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -41,3 +42,12 @@ def source_fingerprint(path: Path, sample_bytes: int = 1024 * 1024) -> str:
 def safe_stem(path: Path) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in path.stem)
     return cleaned.strip("_") or "video"
+
+
+def user_output_prefix(source: str | Path) -> str:
+    """Return a stable, download-friendly prefix derived from the source name."""
+    source_path = Path(source)
+    date_match = re.search(r"(?<!\d)(20\d{6})(?!\d)", source_path.name)
+    if date_match:
+        return f"Robotics_Seminar_{date_match.group(1)}"
+    return safe_stem(source_path)

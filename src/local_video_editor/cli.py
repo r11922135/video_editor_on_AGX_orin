@@ -37,7 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     process_mode.add_argument(
         "--edit-only",
         action="store_true",
-        help="Only create edited.mp4; skip audio extraction, ASR, and summary",
+        help="Only create the date-prefixed edited video; skip ASR and summary",
     )
     process_mode.add_argument(
         "--subtitles",
@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     transcript = sub.add_parser(
         "transcript",
-        help="Rebuild readable transcript.md from an existing transcript.json",
+        help="Rebuild the readable date-prefixed Markdown transcript",
     )
     transcript.add_argument("job_dir", type=Path)
     return parser

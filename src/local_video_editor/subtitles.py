@@ -747,6 +747,7 @@ def create_subtitled_video(
     summary_config: dict[str, Any],
     subtitle_config: dict[str, Any],
     video_config: dict[str, Any],
+    filename_prefix: str | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     chunks = build_alignment_chunks(
@@ -819,8 +820,17 @@ def create_subtitled_video(
     cues = build_cues(words)
     if not cues:
         raise SubtitleError("No usable subtitle cues were produced")
-    atomic_write_text(output_dir / "subtitle.srt", render_subtitle_srt(cues))
-    atomic_write_text(output_dir / "subtitle.ass", render_ass(cues))
+    subtitle_srt_name = (
+        f"{filename_prefix}_subtitle.srt" if filename_prefix else "subtitle.srt"
+    )
+    subtitle_ass_name = (
+        f"{filename_prefix}_subtitle.ass" if filename_prefix else "subtitle.ass"
+    )
+    output_video_name = (
+        f"{filename_prefix}_subtitled.mp4" if filename_prefix else "subtitled.mp4"
+    )
+    atomic_write_text(output_dir / subtitle_srt_name, render_subtitle_srt(cues))
+    atomic_write_text(output_dir / subtitle_ass_name, render_ass(cues))
     if errors:
         atomic_write_text(output_dir / "subtitle.error.log", "\n".join(errors) + "\n")
     else:
@@ -828,10 +838,10 @@ def create_subtitled_video(
 
     if progress is not None:
         progress("Burning subtitles into a separate video (audio stream copied)")
-    output_video = output_dir / "subtitled.mp4"
+    output_video = output_dir / output_video_name
     burn_ass_subtitles(
         edited_video,
-        output_dir / "subtitle.ass",
+        output_dir / subtitle_ass_name,
         output_video,
         output_dir / "subtitle.render.log",
         codec=str(video_config["codec"]),
@@ -840,6 +850,8 @@ def create_subtitled_video(
     )
     return {
         "output": output_video.name,
+        "subtitle_srt": subtitle_srt_name,
+        "subtitle_ass": subtitle_ass_name,
         "cue_count": len(cues),
         "correction": correction,
         "accepted_rule_count": len(rules),

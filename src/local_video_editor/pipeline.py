@@ -19,6 +19,7 @@ from .io_utils import (
     read_json,
     safe_stem,
     source_fingerprint,
+    user_output_prefix,
 )
 from .media import (
     detect_silences,
@@ -34,7 +35,7 @@ from .transcript import render_transcript_markdown, write_transcript_files
 
 
 StatusCallback = Callable[[str, str], None]
-FULL_PIPELINE_REVISION = "cli-two-stage-subtitles-v5"
+FULL_PIPELINE_REVISION = "cli-two-stage-subtitles-v6"
 
 
 def _utc_now() -> str:
@@ -137,7 +138,35 @@ _GENERATED_JOB_FILES = (
 )
 
 
+def _user_output_names(source_name: str) -> dict[str, str]:
+    prefix = user_output_prefix(source_name)
+    return {
+        "video": f"{prefix}_edited.mp4",
+        "subtitled_video": f"{prefix}_subtitled.mp4",
+        "transcript_srt": f"{prefix}_transcript.srt",
+        "transcript_md": f"{prefix}_transcript.md",
+        "summary_en": f"{prefix}_summary.en.md",
+        "summary_zh_tw": f"{prefix}_summary.zh-TW.md",
+        "subtitle_srt": f"{prefix}_subtitle.srt",
+        "subtitle_ass": f"{prefix}_subtitle.ass",
+    }
+
+
 def _clear_generated_job_files(job_dir: Path) -> None:
+    manifest_path = job_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            outputs = read_json(manifest_path).get("outputs", {})
+            if isinstance(outputs, dict):
+                for name in outputs.values():
+                    if (
+                        isinstance(name, str)
+                        and not Path(name).is_absolute()
+                        and len(Path(name).parts) == 1
+                    ):
+                        (job_dir / name).unlink(missing_ok=True)
+        except (OSError, ValueError, AttributeError):
+            pass
     for name in _GENERATED_JOB_FILES:
         (job_dir / name).unlink(missing_ok=True)
     shutil.rmtree(job_dir / ".summary.pending", ignore_errors=True)
@@ -217,6 +246,8 @@ class VideoPipeline:
         if not source.is_file():
             raise PipelineError(f"Input is not a file: {source}")
         fingerprint = source_fingerprint(source)
+        output_names = _user_output_names(source.name)
+        filename_prefix = user_output_prefix(source.name)
         operation = "plan" if plan_only else "edit_only" if edit_only else "full"
         config_fingerprint = _config_fingerprint(
             self.config, operation, subtitles=subtitles
@@ -237,13 +268,20 @@ class VideoPipeline:
             old_status = str(old.get("status", "unknown"))
             terminal_status = "planned" if plan_only else "complete"
             if old_status == terminal_status:
+                cached_subtitle_name = old.get("outputs", {}).get("subtitled_video")
+                cached_subtitle_valid = (
+                    isinstance(cached_subtitle_name, str)
+                    and not Path(cached_subtitle_name).is_absolute()
+                    and len(Path(cached_subtitle_name).parts) == 1
+                    and (job_dir / cached_subtitle_name).is_file()
+                )
                 if subtitles and (
                     old.get("stages", {}).get("subtitles", {}).get("state")
                     != "complete"
-                    or not (job_dir / "subtitled.mp4").is_file()
+                    or not cached_subtitle_valid
                 ):
                     raise PipelineError(
-                        "Existing job completed without a valid subtitled.mp4; "
+                        "Existing job completed without a valid subtitled video; "
                         f"use --force to retry it: {job_dir}"
                     )
                 self.status("cached", f"Using existing job: {job_dir}")
@@ -355,7 +393,7 @@ class VideoPipeline:
                 atomic_write_json(manifest_path, manifest)
                 return {"job_id": job_id, "job_dir": str(job_dir), "manifest": manifest}
 
-            edited_video = job_dir / "edited.mp4"
+            edited_video = job_dir / output_names["video"]
             self._stage(
                 manifest,
                 manifest_path,
@@ -440,7 +478,12 @@ class VideoPipeline:
             )
             atomic_write_json(job_dir / "transcript.json", transcription)
             segments = transcription["segments"]
-            write_transcript_files(segments, title=source.stem, output_dir=job_dir)
+            write_transcript_files(
+                segments,
+                title=source.stem,
+                output_dir=job_dir,
+                filename_prefix=filename_prefix,
+            )
             self._stage(
                 manifest,
                 manifest_path,
@@ -488,6 +531,7 @@ class VideoPipeline:
                 metrics,
                 source_name=source.name,
                 output_dir=job_dir,
+                filename_prefix=filename_prefix,
             )
             self._stage(
                 manifest,
@@ -517,6 +561,7 @@ class VideoPipeline:
                         summary_config=summary_cfg,
                         subtitle_config=self.config["subtitles"],
                         video_config=self.config["video"],
+                        filename_prefix=filename_prefix,
                         progress=lambda message: self._stage(
                             manifest,
                             manifest_path,
@@ -526,20 +571,20 @@ class VideoPipeline:
                             optional=True,
                         ),
                     )
-                    subtitled_video = job_dir / "subtitled.mp4"
+                    subtitled_video = job_dir / subtitle_metrics["output"]
                     subtitle_probe = probe_media(subtitled_video)
                     subtitle_duration = media_duration(subtitle_probe)
                     edited_duration = media_duration(edited_probe)
                     if abs(subtitle_duration - edited_duration) > 1.0:
                         raise PipelineError(
-                            "Subtitled video duration differs from edited.mp4 by more "
+                            "Subtitled video duration differs from the edited video by more "
                             "than one second"
                         )
                     atomic_write_json(job_dir / "subtitle.probe.json", subtitle_probe)
                     subtitle_outputs = {
-                        "subtitled_video": "subtitled.mp4",
-                        "subtitle_srt": "subtitle.srt",
-                        "subtitle_ass": "subtitle.ass",
+                        "subtitled_video": subtitle_metrics["output"],
+                        "subtitle_srt": subtitle_metrics["subtitle_srt"],
+                        "subtitle_ass": subtitle_metrics["subtitle_ass"],
                         "subtitle_rules": "subtitle.rules.json",
                         "subtitle_corrected": "subtitle.corrected.json",
                         "subtitle_correction_raw": "subtitle.correction.raw.txt",
@@ -557,14 +602,14 @@ class VideoPipeline:
                         "subtitles",
                         "complete",
                         f"Burned {subtitle_metrics['cue_count']} subtitle cues into "
-                        f"subtitled.mp4{fallback_note}",
+                        f"{subtitled_video.name}{fallback_note}",
                         optional=True,
                         duration=subtitle_duration,
                         size=subtitled_video.stat().st_size,
                         **subtitle_metrics,
                     )
                 except Exception as exc:
-                    (job_dir / "subtitled.mp4").unlink(missing_ok=True)
+                    (job_dir / output_names["subtitled_video"]).unlink(missing_ok=True)
                     (job_dir / "subtitle.probe.json").unlink(missing_ok=True)
                     error_path = job_dir / "subtitle.error.log"
                     previous = (
@@ -599,10 +644,10 @@ class VideoPipeline:
             manifest["outputs"] = {
                 "video": edited_video.name,
                 "transcript_json": "transcript.json",
-                "transcript_srt": "transcript.srt",
-                "transcript_md": "transcript.md",
-                "summary_en": "summary.en.md",
-                "summary_zh_tw": "summary.zh-TW.md",
+                "transcript_srt": output_names["transcript_srt"],
+                "transcript_md": output_names["transcript_md"],
+                "summary_en": output_names["summary_en"],
+                "summary_zh_tw": output_names["summary_zh_tw"],
                 "summary_json": "summary.json",
                 "summary_en_raw": "summary.en.raw.txt",
                 "summary_zh_tw_raw": "summary.zh-TW.raw.txt",
@@ -660,7 +705,10 @@ def _resummarize_job_unlocked(
     }
     atomic_write_json(manifest_path, manifest)
     try:
-        source_title = Path(manifest["source"]["name"]).stem
+        source_name = str(manifest["source"]["name"])
+        source_title = Path(source_name).stem
+        filename_prefix = user_output_prefix(source_name)
+        output_names = _user_output_names(source_name)
 
         def progress(message: str) -> None:
             now = _utc_now()
@@ -689,14 +737,15 @@ def _resummarize_job_unlocked(
             metrics,
             source_name=str(manifest["source"]["name"]),
             output_dir=pending_dir,
+            filename_prefix=filename_prefix,
         )
         for name in (
             "summary.en.raw.txt",
             "summary.zh-TW.raw.txt",
             "summary.json",
             "summary.metrics.json",
-            "summary.en.md",
-            "summary.zh-TW.md",
+            output_names["summary_en"],
+            output_names["summary_zh_tw"],
         ):
             (pending_dir / name).replace(job_dir / name)
         pending_dir.rmdir()
@@ -712,17 +761,17 @@ def _resummarize_job_unlocked(
         }
         outputs = manifest.setdefault("outputs", {})
         for key, path in {
-            "video": job_dir / "edited.mp4",
+            "video": job_dir / output_names["video"],
             "transcript_json": job_dir / "transcript.json",
-            "transcript_srt": job_dir / "transcript.srt",
-            "transcript_md": job_dir / "transcript.md",
+            "transcript_srt": job_dir / output_names["transcript_srt"],
+            "transcript_md": job_dir / output_names["transcript_md"],
         }.items():
             if path.is_file():
                 outputs[key] = path.name
         outputs.update(
             {
-                "summary_en": "summary.en.md",
-                "summary_zh_tw": "summary.zh-TW.md",
+                "summary_en": output_names["summary_en"],
+                "summary_zh_tw": output_names["summary_zh_tw"],
                 "summary_json": "summary.json",
                 "summary_en_raw": "summary.en.raw.txt",
                 "summary_zh_tw_raw": "summary.zh-TW.raw.txt",
@@ -774,7 +823,7 @@ def _rerender_transcript_job_unlocked(job_dir: Path) -> dict[str, Any]:
         raise PipelineError("Transcript has no speech segments to format")
 
     source_name = str(manifest.get("source", {}).get("name", "Transcript"))
-    output_path = job_dir / "transcript.md"
+    output_path = job_dir / _user_output_names(source_name)["transcript_md"]
     atomic_write_text(
         output_path,
         render_transcript_markdown(segments, title=Path(source_name).stem),
