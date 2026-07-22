@@ -34,7 +34,7 @@ from .transcript import render_transcript_markdown, write_transcript_files
 
 
 StatusCallback = Callable[[str, str], None]
-FULL_PIPELINE_REVISION = "cli-two-stage-subtitles-v5"
+FULL_PIPELINE_REVISION = "cli-two-stage-subtitles-v6"
 
 
 def _utc_now() -> str:
@@ -513,6 +513,7 @@ class VideoPipeline:
                         analysis_audio=analysis_audio,
                         edited_video=edited_video,
                         segments=deepcopy(segments),
+                        source_title=source.stem,
                         output_dir=job_dir,
                         summary_config=summary_cfg,
                         subtitle_config=self.config["subtitles"],

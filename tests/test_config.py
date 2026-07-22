@@ -58,9 +58,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(
             subtitles["aligner_model"], "Qwen/Qwen3-ForcedAligner-0.6B"
         )
-        self.assertEqual(subtitles["correction_context_tokens"], 24576)
-        self.assertEqual(subtitles["correction_output_tokens"], 512)
-        self.assertEqual(subtitles["correction_max_rules"], 10)
+        self.assertEqual(subtitles["correction_context_tokens"], 65536)
+        self.assertEqual(subtitles["correction_output_tokens"], 2048)
+        self.assertEqual(subtitles["correction_candidate_limit"], 48)
+        self.assertEqual(subtitles["correction_rule_safety_cap"], 32)
         self.assertEqual(subtitles["alignment_chunk_seconds"], 120)
 
     def test_rejects_invalid_subtitle_settings(self):
@@ -69,9 +70,11 @@ class ConfigTests(unittest.TestCase):
             ("correction_context_tokens", 8191, "correction_context_tokens"),
             ("correction_context_tokens", 65537, "correction_context_tokens"),
             ("correction_output_tokens", 127, "correction_output_tokens"),
-            ("correction_output_tokens", 24576, "correction_output_tokens"),
-            ("correction_max_rules", 0, "correction_max_rules"),
-            ("correction_max_rules", 31, "correction_max_rules"),
+            ("correction_output_tokens", 65536, "correction_output_tokens"),
+            ("correction_candidate_limit", 7, "correction_candidate_limit"),
+            ("correction_candidate_limit", 97, "correction_candidate_limit"),
+            ("correction_rule_safety_cap", 0, "correction_rule_safety_cap"),
+            ("correction_rule_safety_cap", 65, "correction_rule_safety_cap"),
             ("alignment_chunk_seconds", 29, "alignment_chunk_seconds"),
             ("alignment_chunk_seconds", 151, "alignment_chunk_seconds"),
         )
