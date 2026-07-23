@@ -6,12 +6,6 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src
 
 WORKDIR /app
-RUN PIP_CONSTRAINT= python3 -m pip install --no-cache-dir --no-deps \
-    "transformers==4.57.6" \
-    "qwen-asr==0.0.6"
-RUN PIP_CONSTRAINT= python3 -m pip install --no-cache-dir \
-    "librosa==0.11.0" \
-    "nagisa==0.2.11"
 
 COPY pyproject.toml /app/pyproject.toml
 COPY src /app/src

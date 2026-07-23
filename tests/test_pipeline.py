@@ -129,7 +129,7 @@ class PipelineTests(unittest.TestCase):
             _config_fingerprint(config, "full", subtitles=True),
         )
         changed = copy.deepcopy(config)
-        changed["subtitles"]["alignment_chunk_seconds"] = 90
+        changed["subtitles"]["correction_scope_seconds"] = 90
         self.assertEqual(
             _config_fingerprint(config, "full", subtitles=False),
             _config_fingerprint(changed, "full", subtitles=False),
