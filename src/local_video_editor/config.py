@@ -31,12 +31,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_output_tokens": 16384,
     },
     "subtitles": {
-        "aligner_model": "Qwen/Qwen3-ForcedAligner-0.6B",
         "correction_context_tokens": 65536,
         "correction_output_tokens": 2048,
         "correction_candidate_limit": 48,
         "correction_rule_safety_cap": 32,
-        "alignment_chunk_seconds": 120,
+        "correction_scope_seconds": 120,
     },
 }
 
@@ -56,6 +55,17 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
         supplied = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(supplied, dict):
             raise ValueError("Config root must be a JSON object")
+        supplied_subtitles = supplied.get("subtitles")
+        if isinstance(supplied_subtitles, dict):
+            if (
+                "correction_scope_seconds" not in supplied_subtitles
+                and "alignment_chunk_seconds" in supplied_subtitles
+            ):
+                supplied_subtitles["correction_scope_seconds"] = supplied_subtitles[
+                    "alignment_chunk_seconds"
+                ]
+            supplied_subtitles.pop("alignment_chunk_seconds", None)
+            supplied_subtitles.pop("aligner_model", None)
         _merge(config, supplied)
     validate_config(config)
     return config
@@ -101,8 +111,6 @@ def validate_config(config: dict[str, Any]) -> None:
             "summary.max_output_tokens must be smaller than summary.context_tokens"
         )
     subtitles = config["subtitles"]
-    if not str(subtitles.get("aligner_model", "")).strip():
-        raise ValueError("subtitles.aligner_model must not be empty")
     correction_context = int(subtitles["correction_context_tokens"])
     correction_output = int(subtitles["correction_output_tokens"])
     if not 8192 <= correction_context <= 65536:
@@ -121,7 +129,7 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError(
             "subtitles.correction_rule_safety_cap must be between 1 and 64"
         )
-    if not 30 <= int(subtitles["alignment_chunk_seconds"]) <= 150:
+    if not 30 <= int(subtitles["correction_scope_seconds"]) <= 150:
         raise ValueError(
-            "subtitles.alignment_chunk_seconds must be between 30 and 150"
+            "subtitles.correction_scope_seconds must be between 30 and 150"
         )

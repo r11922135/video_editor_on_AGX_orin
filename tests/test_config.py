@@ -1,6 +1,8 @@
 from pathlib import Path
 import copy
+import json
 import sys
+import tempfile
 import unittest
 
 
@@ -8,7 +10,11 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from local_video_editor.config import DEFAULT_CONFIG, validate_config  # noqa: E402
+from local_video_editor.config import (  # noqa: E402
+    DEFAULT_CONFIG,
+    load_config,
+    validate_config,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -55,18 +61,15 @@ class ConfigTests(unittest.TestCase):
 
     def test_subtitle_defaults_are_bounded_for_local_inference(self):
         subtitles = DEFAULT_CONFIG["subtitles"]
-        self.assertEqual(
-            subtitles["aligner_model"], "Qwen/Qwen3-ForcedAligner-0.6B"
-        )
+        self.assertNotIn("aligner_model", subtitles)
         self.assertEqual(subtitles["correction_context_tokens"], 65536)
         self.assertEqual(subtitles["correction_output_tokens"], 2048)
         self.assertEqual(subtitles["correction_candidate_limit"], 48)
         self.assertEqual(subtitles["correction_rule_safety_cap"], 32)
-        self.assertEqual(subtitles["alignment_chunk_seconds"], 120)
+        self.assertEqual(subtitles["correction_scope_seconds"], 120)
 
     def test_rejects_invalid_subtitle_settings(self):
         cases = (
-            ("aligner_model", "", "aligner_model"),
             ("correction_context_tokens", 8191, "correction_context_tokens"),
             ("correction_context_tokens", 65537, "correction_context_tokens"),
             ("correction_output_tokens", 127, "correction_output_tokens"),
@@ -75,8 +78,8 @@ class ConfigTests(unittest.TestCase):
             ("correction_candidate_limit", 97, "correction_candidate_limit"),
             ("correction_rule_safety_cap", 0, "correction_rule_safety_cap"),
             ("correction_rule_safety_cap", 65, "correction_rule_safety_cap"),
-            ("alignment_chunk_seconds", 29, "alignment_chunk_seconds"),
-            ("alignment_chunk_seconds", 151, "alignment_chunk_seconds"),
+            ("correction_scope_seconds", 29, "correction_scope_seconds"),
+            ("correction_scope_seconds", 151, "correction_scope_seconds"),
         )
         for key, value, message in cases:
             with self.subTest(key=key, value=value):
@@ -84,6 +87,27 @@ class ConfigTests(unittest.TestCase):
                 config["subtitles"][key] = value
                 with self.assertRaisesRegex(ValueError, message):
                     validate_config(config)
+
+    def test_legacy_aligner_settings_are_normalized_before_use(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "subtitles": {
+                            "aligner_model": "unused",
+                            "alignment_chunk_seconds": 90,
+                        }
+                    }
+                )
+            )
+
+            config = load_config(path)
+
+        subtitles = config["subtitles"]
+        self.assertEqual(subtitles["correction_scope_seconds"], 90)
+        self.assertNotIn("alignment_chunk_seconds", subtitles)
+        self.assertNotIn("aligner_model", subtitles)
 
 
 if __name__ == "__main__":

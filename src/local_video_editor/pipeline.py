@@ -34,7 +34,7 @@ from .transcript import render_transcript_markdown, write_transcript_files
 
 
 StatusCallback = Callable[[str, str], None]
-FULL_PIPELINE_REVISION = "cli-two-stage-subtitles-v6"
+FULL_PIPELINE_REVISION = "cli-two-stage-subtitles-v7-whisper-timing"
 
 
 def _utc_now() -> str:
@@ -510,7 +510,6 @@ class VideoPipeline:
                 )
                 try:
                     subtitle_metrics = create_subtitled_video(
-                        analysis_audio=analysis_audio,
                         edited_video=edited_video,
                         segments=deepcopy(segments),
                         source_title=source.stem,
@@ -548,7 +547,7 @@ class VideoPipeline:
                     if (job_dir / "subtitle.error.log").is_file():
                         subtitle_outputs["subtitle_error"] = "subtitle.error.log"
                     fallback_note = (
-                        " (best-effort fallback used)"
+                        " (subtitle correction fallback used)"
                         if subtitle_metrics["fallback_used"]
                         else ""
                     )

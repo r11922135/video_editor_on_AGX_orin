@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     process_mode.add_argument(
         "--subtitles",
         action="store_true",
-        help="Also correct, align, and burn best-effort English subtitles",
+        help="Also correct and burn English subtitles using Whisper timestamps",
     )
 
     summarize = sub.add_parser(

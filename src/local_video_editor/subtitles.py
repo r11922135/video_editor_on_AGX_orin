@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import gc
 import hashlib
 import json
 import math
-import os
 import re
 import time
 import unicodedata
@@ -39,7 +37,7 @@ def _join_tokens(tokens: Iterable[str]) -> str:
 
 
 def _source_token_spans(text: str) -> list[dict[str, Any]]:
-    """Split display text the same way the aligner treats whitespace words."""
+    """Split normalized display text into stable source tokens."""
     tokens: list[dict[str, Any]] = []
     for match in re.finditer(r"\S+", text):
         token = match.group(0)
@@ -57,7 +55,7 @@ def _source_token_spans(text: str) -> list[dict[str, Any]]:
     return tokens
 
 
-def _aligner_key(value: str) -> str:
+def _token_key(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value).casefold()
     return "".join(
         character
@@ -91,7 +89,7 @@ def _timed_source_tokens(
             or word_end < word_start
         ):
             continue
-        key = _aligner_key(word_text)
+        key = _token_key(word_text)
         if not key:
             continue
         word_start = min(end, max(start, word_start))
@@ -111,7 +109,7 @@ def _timed_source_tokens(
     ):
         valid_words = []
 
-    source_keys = [_aligner_key(item["text"]) for item in source]
+    source_keys = [_token_key(item["text"]) for item in source]
     word_keys = [str(item["key"]) for item in valid_words]
     timings: list[tuple[float, float, str, float | None]] = []
     if (
@@ -214,10 +212,10 @@ def _phonetic_similarity(left: str, right: str) -> float:
     return SequenceMatcher(None, left_clean, right_clean).ratio()
 
 
-def build_alignment_chunks(
+def build_correction_chunks(
     segments: Iterable[dict[str, Any]], *, max_seconds: int
 ) -> list[dict[str, Any]]:
-    """Group raw ASR segments into bounded correction/alignment scopes."""
+    """Group raw ASR segments into bounded local-correction scopes."""
     if not 30 <= int(max_seconds) <= 150:
         raise ValueError("max_seconds must be between 30 and 150")
     cleaned: list[dict[str, Any]] = []
@@ -871,230 +869,33 @@ def propose_correction_rules(
     return rules, metrics, raw, candidates
 
 
-def _fallback_source_timeline(chunk: dict[str, Any]) -> list[dict[str, Any]]:
+def _whisper_source_timeline(chunk: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
             **token,
             "source_text": str(token["text"]),
-            "timing_source": str(token.get("timing_source", "whisper_fallback")),
+            "timing_source": str(token.get("timing_source", "segment_interpolation")),
         }
         for token in chunk.get("source_tokens", [])
     ]
 
 
-def _local_model_snapshot(model_name: str) -> str:
-    configured = Path(model_name).expanduser()
-    if configured.is_dir():
-        return str(configured.resolve())
-
-    cache_root = os.environ.get("HUGGINGFACE_HUB_CACHE")
-    if not cache_root and os.environ.get("HF_HOME"):
-        cache_root = str(Path(os.environ["HF_HOME"]) / "hub")
-    if not cache_root or "/" not in model_name:
-        raise SubtitleError(
-            f"Forced Aligner is not a local directory and no mounted HF cache "
-            f"contains it: {model_name}"
-        )
-    repository = Path(cache_root) / f"models--{model_name.replace('/', '--')}"
-    reference = repository / "refs" / "main"
-    if not reference.is_file():
-        raise SubtitleError(f"Forced Aligner is not cached locally: {model_name}")
-    revision = reference.read_text(encoding="utf-8").strip()
-    snapshot_root = (repository / "snapshots").resolve()
-    snapshot = (snapshot_root / revision).resolve()
-    if snapshot.parent != snapshot_root or not snapshot.is_dir():
-        raise SubtitleError(f"Forced Aligner cache snapshot is invalid: {model_name}")
-    return str(snapshot)
-
-
-def attach_source_tokens(
-    chunk: dict[str, Any], aligned: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    source = list(chunk.get("source_tokens", []))
-    source_keys = [_aligner_key(str(token["text"])) for token in source]
-    aligned_keys = [_aligner_key(str(item["text"])) for item in aligned]
-    if not source or not aligned or "" in source_keys or "" in aligned_keys:
-        raise SubtitleError(
-            f"Aligner returned {len(aligned)} words for {len(source)} source tokens"
-        )
-    if "".join(source_keys) != "".join(aligned_keys):
-        raise SubtitleError("Aligner text does not match the original ASR text")
-
-    source_ranges: list[tuple[int, int]] = []
-    cursor = 0
-    for key in source_keys:
-        source_ranges.append((cursor, cursor + len(key)))
-        cursor += len(key)
-    aligned_ranges: list[tuple[int, int]] = []
-    cursor = 0
-    for key in aligned_keys:
-        aligned_ranges.append((cursor, cursor + len(key)))
-        cursor += len(key)
-
-    result: list[dict[str, Any]] = []
-    for token, (source_start, source_end) in zip(source, source_ranges):
-        overlaps = [
-            item
-            for item, (aligned_start, aligned_end) in zip(aligned, aligned_ranges)
-            if aligned_end > source_start and aligned_start < source_end
-        ]
-        if not overlaps:
-            raise SubtitleError(
-                f"Aligner produced no timing for source token {token['text']!r}"
-            )
-        result.append(
-            {
-                **token,
-                "source_text": str(token["text"]),
-                "start": float(overlaps[0]["start"]),
-                "end": float(overlaps[-1]["end"]),
-                "timing_source": "forced_aligner",
-            }
-        )
-    return result
-
-
-def _validated_alignment(
-    items: list[dict[str, Any]],
-    *,
-    audio_seconds: float,
-    boundary_tolerance: float = 2.0,
-) -> list[dict[str, Any]]:
-    if not items:
-        raise SubtitleError("Aligner returned no words")
-    validated: list[dict[str, Any]] = []
-    previous_start = -0.05
-    for item in items:
-        start = float(item["start"])
-        end = float(item["end"])
-        if not math.isfinite(start) or not math.isfinite(end):
-            raise SubtitleError("Aligner returned a non-finite timestamp")
-        if (
-            start < -float(boundary_tolerance)
-            or end < start
-            or end > audio_seconds + float(boundary_tolerance)
-        ):
-            raise SubtitleError(
-                f"Aligner timestamp {start:.3f}-{end:.3f}s is outside its audio chunk"
-            )
-        if start + 0.05 < previous_start:
-            raise SubtitleError("Aligner timestamps are not monotonic")
-        start = min(audio_seconds, max(0.0, start, previous_start))
-        end = min(audio_seconds, max(start, end))
-        validated.append({**item, "start": start, "end": end})
-        previous_start = start
-    return validated
-
-
-def align_chunks(
-    audio_path: Path,
-    chunks: list[dict[str, Any]],
-    *,
-    model_name: str,
-    progress: Callable[[str], None] | None = None,
+def build_whisper_timeline(
+    chunks: Iterable[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    started = time.monotonic()
-    errors: list[str] = []
-    aligned_words: list[dict[str, Any]] = []
-    try:
-        import soundfile as sf
-        import torch
-        from qwen_asr import Qwen3ForcedAligner
-
-        if not torch.cuda.is_available():
-            raise SubtitleError("CUDA is unavailable for Forced Aligner")
-        audio, sample_rate = sf.read(
-            str(audio_path), dtype="float32", always_2d=False
-        )
-        if getattr(audio, "ndim", 1) != 1:
-            raise SubtitleError("Forced Aligner expects mono analysis audio")
-        torch.cuda.reset_peak_memory_stats()
-        load_started = time.monotonic()
-        local_model = _local_model_snapshot(model_name)
-        model = Qwen3ForcedAligner.from_pretrained(
-            local_model,
-            dtype=torch.bfloat16,
-            device_map="cuda:0",
-            local_files_only=True,
-        )
-        torch.cuda.synchronize()
-        load_seconds = time.monotonic() - load_started
-    except Exception as exc:
-        fallback = [
-            word for chunk in chunks for word in _fallback_source_timeline(chunk)
-        ]
-        return fallback, {
-            "status": "fallback",
-            "model": model_name,
-            "error": str(exc),
-            "aligned_chunk_count": 0,
-            "fallback_chunk_count": len(chunks),
-            "word_count": len(fallback),
-            "elapsed_seconds": time.monotonic() - started,
-        }
-
-    aligned_count = 0
-    fallback_count = 0
-    try:
-        for index, chunk in enumerate(chunks, 1):
-            if progress is not None:
-                progress(f"Forced-aligning subtitle chunk {index}/{len(chunks)}")
-            start_sample = max(0, int((float(chunk["start"]) - 0.25) * sample_rate))
-            end_sample = min(
-                len(audio), int((float(chunk["end"]) + 0.25) * sample_rate)
-            )
-            offset = start_sample / float(sample_rate)
-            chunk_audio_seconds = (end_sample - start_sample) / float(sample_rate)
-            try:
-                result = model.align(
-                    audio=(audio[start_sample:end_sample], int(sample_rate)),
-                    text=str(chunk["text"]),
-                    language="English",
-                )[0]
-                relative = [
-                    {
-                        "start": float(item.start_time),
-                        "end": float(item.end_time),
-                        "text": str(item.text),
-                    }
-                    for item in result
-                ]
-                relative = _validated_alignment(
-                    relative, audio_seconds=chunk_audio_seconds
-                )
-                source_timeline = attach_source_tokens(chunk, relative)
-                for item in source_timeline:
-                    item["start"] += offset
-                    item["end"] += offset
-                aligned_words.extend(source_timeline)
-                aligned_count += 1
-            except Exception as exc:
-                fallback_count += 1
-                errors.append(f"{chunk['id']}: {exc}")
-                aligned_words.extend(_fallback_source_timeline(chunk))
-        torch.cuda.synchronize()
-        peak_cuda_bytes = int(torch.cuda.max_memory_allocated())
-    finally:
-        del model
-        gc.collect()
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-
-    aligned_words.sort(
-        key=lambda item: (str(item["chunk_id"]), int(item["token_index"]))
-    )
-    return aligned_words, {
-        "status": "complete" if not errors else "partial_fallback",
-        "model": model_name,
-        "model_load_seconds": load_seconds,
-        "aligned_chunk_count": aligned_count,
-        "fallback_chunk_count": fallback_count,
-        "word_count": len(aligned_words),
-        "peak_cuda_bytes": peak_cuda_bytes,
-        "elapsed_seconds": time.monotonic() - started,
-        "errors": errors,
+    """Use only Faster Whisper word or segment timestamps for subtitle timing."""
+    words = [
+        word
+        for chunk in chunks
+        for word in _whisper_source_timeline(chunk)
+    ]
+    timing_sources = Counter(str(word["timing_source"]) for word in words)
+    return words, {
+        "status": "complete",
+        "source": "faster_whisper",
+        "additional_timing_model_used": False,
+        "word_count": len(words),
+        "timing_source_counts": dict(sorted(timing_sources.items())),
     }
 
 
@@ -1453,7 +1254,6 @@ def render_ass(cues: Iterable[dict[str, Any]]) -> str:
 
 def create_subtitled_video(
     *,
-    analysis_audio: Path,
     edited_video: Path,
     segments: list[dict[str, Any]],
     source_title: str,
@@ -1463,8 +1263,8 @@ def create_subtitled_video(
     video_config: dict[str, Any],
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    chunks = build_alignment_chunks(
-        segments, max_seconds=int(subtitle_config["alignment_chunk_seconds"])
+    chunks = build_correction_chunks(
+        segments, max_seconds=int(subtitle_config["correction_scope_seconds"])
     )
     if not chunks:
         raise SubtitleError("Transcript has no text to subtitle")
@@ -1518,18 +1318,9 @@ def create_subtitled_video(
         },
     )
 
-    # Alignment deliberately receives immutable ASR text. Corrections are projected
-    # onto its timeline afterwards, so a spelling change can never make alignment
-    # fail and the same display text is retained when a chunk uses fallback timing.
-    words, alignment = align_chunks(
-        analysis_audio,
-        chunks,
-        model_name=str(subtitle_config["aligner_model"]),
-        progress=progress,
-    )
-    errors.extend(f"alignment: {item}" for item in alignment.get("errors", []))
-    if alignment.get("error"):
-        errors.append(f"alignment: {alignment['error']}")
+    if progress is not None:
+        progress("Projecting corrected text onto Whisper timestamps")
+    words, timing = build_whisper_timeline(chunks)
     display_words = project_corrections(words, corrected)
     cues = build_cues(display_words)
     if not cues:
@@ -1547,7 +1338,9 @@ def create_subtitled_video(
         {
             "canonical_transcript_modified": False,
             "summary_input_modified": False,
-            "alignment_input_modified": False,
+            "timing_source": "faster_whisper",
+            "additional_timing_model_used": False,
+            "correction_projection_changed_source_timestamps": False,
             "correction": correction,
             "candidates": candidates,
             "rules": [
@@ -1585,7 +1378,7 @@ def create_subtitled_video(
         "all_selected_corrections_delivered": delivery_audit[
             "all_selected_corrections_delivered"
         ],
-        "alignment": alignment,
+        "timing": timing,
         "fallback_used": bool(errors),
         "errors": errors,
     }

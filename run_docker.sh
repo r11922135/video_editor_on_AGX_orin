@@ -37,7 +37,6 @@ common=(
   --env "HOME=/tmp"
   --env "USER=video-editor"
   --env "LOGNAME=video-editor"
-  --env "TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor"
   --env "HF_HOME=/data/models/huggingface"
   --env "HUGGINGFACE_HUB_CACHE=/data/models/huggingface/hub"
   --env "FFMPEG_BIN=/usr/bin/ffmpeg"

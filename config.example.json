@@ -25,11 +25,10 @@
     "max_output_tokens": 16384
   },
   "subtitles": {
-    "aligner_model": "Qwen/Qwen3-ForcedAligner-0.6B",
     "correction_context_tokens": 65536,
     "correction_output_tokens": 2048,
     "correction_candidate_limit": 48,
     "correction_rule_safety_cap": 32,
-    "alignment_chunk_seconds": 120
+    "correction_scope_seconds": 120
   }
 }

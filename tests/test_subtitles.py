@@ -1,6 +1,5 @@
 from pathlib import Path
 import copy
-import os
 import sys
 import tempfile
 import unittest
@@ -14,14 +13,12 @@ if str(SRC) not in sys.path:
 from local_video_editor.subtitles import (  # noqa: E402
     SubtitleError,
     apply_correction_rules,
-    attach_source_tokens,
     audit_correction_delivery,
-    build_alignment_chunks,
+    build_correction_chunks,
     build_cues,
+    build_whisper_timeline,
     correction_schema,
     create_subtitled_video,
-    _local_model_snapshot,
-    _validated_alignment,
     mine_correction_candidates,
     project_corrections,
     render_ass,
@@ -31,7 +28,7 @@ from local_video_editor.subtitles import (  # noqa: E402
 
 
 class SubtitleTests(unittest.TestCase):
-    def test_create_pipeline_aligns_original_text_then_projects_correction(self):
+    def test_create_pipeline_uses_whisper_timing_and_projects_correction(self):
         segments = [
             {
                 "id": 0,
@@ -44,26 +41,6 @@ class SubtitleTests(unittest.TestCase):
                 ],
             }
         ]
-        observed = {}
-
-        def fake_align(_audio, chunks, **_kwargs):
-            observed["alignment_text"] = [chunk["text"] for chunk in chunks]
-            words = [
-                {
-                    **token,
-                    "source_text": token["text"],
-                    "timing_source": "test",
-                }
-                for chunk in chunks
-                for token in chunk["source_tokens"]
-            ]
-            return words, {
-                "status": "complete",
-                "aligned_chunk_count": 1,
-                "fallback_chunk_count": 0,
-                "errors": [],
-            }
-
         def fake_burn(_source, _ass, output, _log, **_kwargs):
             output.write_bytes(b"subtitled-video")
 
@@ -83,14 +60,11 @@ class SubtitleTests(unittest.TestCase):
             "local_video_editor.subtitles.propose_correction_rules",
             return_value=(rules, {"status": "complete"}, "{}", []),
         ), patch(
-            "local_video_editor.subtitles.align_chunks", side_effect=fake_align
-        ), patch(
             "local_video_editor.subtitles.burn_ass_subtitles",
             side_effect=fake_burn,
         ):
             output = Path(raw)
             result = create_subtitled_video(
-                analysis_audio=output / "analysis.wav",
                 edited_video=output / "edited.mp4",
                 segments=segments,
                 source_title="Training",
@@ -100,46 +74,36 @@ class SubtitleTests(unittest.TestCase):
                     "model": "qwen",
                 },
                 subtitle_config={
-                    "aligner_model": "aligner",
                     "correction_context_tokens": 8192,
                     "correction_output_tokens": 512,
                     "correction_candidate_limit": 8,
                     "correction_rule_safety_cap": 8,
-                    "alignment_chunk_seconds": 30,
+                    "correction_scope_seconds": 30,
                 },
                 video_config={"codec": "libx264", "preset": "fast", "crf": 20},
             )
 
-            self.assertEqual(observed["alignment_text"], ["LOS works."])
-            self.assertIn("ROS works.", (output / "subtitle.srt").read_text())
+            srt = (output / "subtitle.srt").read_text()
+            self.assertIn("00:00:00,000 --> 00:00:02,000", srt)
+            self.assertIn("ROS works.", srt)
             self.assertEqual(segments[0]["text"], "LOS works.")
             self.assertTrue(result["all_selected_corrections_delivered"])
+            self.assertEqual(result["timing"]["source"], "faster_whisper")
+            self.assertFalse(result["timing"]["additional_timing_model_used"])
+            self.assertEqual(
+                result["timing"]["timing_source_counts"], {"whisper_word": 2}
+            )
+            self.assertFalse(result["fallback_used"])
+            self.assertEqual(result["errors"], [])
 
-    def test_local_model_snapshot_resolves_mounted_cache_without_user_home(self):
-        with tempfile.TemporaryDirectory() as raw:
-            cache = Path(raw) / "hub"
-            repository = cache / "models--Qwen--Aligner"
-            snapshot = repository / "snapshots" / "abc123"
-            snapshot.mkdir(parents=True)
-            (repository / "refs").mkdir()
-            (repository / "refs" / "main").write_text("abc123\n")
-            with patch.dict(
-                os.environ,
-                {"HUGGINGFACE_HUB_CACHE": str(cache)},
-                clear=False,
-            ):
-                self.assertEqual(
-                    _local_model_snapshot("Qwen/Aligner"), str(snapshot.resolve())
-                )
-
-    def test_alignment_chunks_are_ordered_bounded_and_lossless(self):
+    def test_correction_chunks_are_ordered_bounded_and_lossless(self):
         segments = [
             {"id": 2, "start": 42.0, "end": 55.0, "text": "  Third   part. "},
             {"id": 0, "start": 0.0, "end": 12.0, "text": "First part."},
             {"id": 1, "start": 15.0, "end": 28.0, "text": "Second part."},
         ]
 
-        chunks = build_alignment_chunks(segments, max_seconds=30)
+        chunks = build_correction_chunks(segments, max_seconds=30)
 
         self.assertEqual([chunk["id"] for chunk in chunks], ["c001", "c002"])
         self.assertEqual(chunks[0]["start"], 0.0)
@@ -156,7 +120,7 @@ class SubtitleTests(unittest.TestCase):
         self.assertEqual(segments[0]["text"], "  Third   part. ")
 
     def test_candidate_mining_and_rule_validation_supports_both_scopes(self):
-        chunks = build_alignment_chunks(
+        chunks = build_correction_chunks(
             [
                 {
                     "id": 0,
@@ -215,7 +179,7 @@ class SubtitleTests(unittest.TestCase):
         self.assertEqual(report["accepted_local_rule_count"], 1)
 
     def test_candidate_mining_supports_spaced_names_and_acronyms(self):
-        chunks = build_alignment_chunks(
+        chunks = build_correction_chunks(
             [
                 {
                     "id": 0,
@@ -251,7 +215,7 @@ class SubtitleTests(unittest.TestCase):
         self.assertEqual(report["accepted_document_rule_count"], 1)
 
     def test_rule_validation_rejects_unknown_or_unsafe_corrections(self):
-        chunks = build_alignment_chunks(
+        chunks = build_correction_chunks(
             [
                 {
                     "id": 0,
@@ -301,7 +265,7 @@ class SubtitleTests(unittest.TestCase):
         self.assertEqual(report["rejection_reasons"]["unknown_scope"], 1)
 
     def test_local_rule_rejects_ordinary_semantic_rewrite(self):
-        chunks = build_alignment_chunks(
+        chunks = build_correction_chunks(
             [{"id": 0, "start": 0.0, "end": 2.0, "text": "The motor turns."}],
             max_seconds=30,
         )
@@ -322,7 +286,7 @@ class SubtitleTests(unittest.TestCase):
         self.assertEqual(report["rejection_reasons"]["unsafe_local_scope"], 1)
 
     def test_document_rule_accepts_observed_acronym_with_asr_suffix(self):
-        chunks = build_alignment_chunks(
+        chunks = build_correction_chunks(
             [
                 {
                     "id": 0,
@@ -351,7 +315,7 @@ class SubtitleTests(unittest.TestCase):
         )
 
     def test_document_rule_balances_unseen_technical_replacements(self):
-        chunks = build_alignment_chunks(
+        chunks = build_correction_chunks(
             [
                 {
                     "id": 0,
@@ -393,7 +357,7 @@ class SubtitleTests(unittest.TestCase):
         self.assertEqual(report["rejection_reasons"]["low_similarity"], 2)
 
     def test_document_rule_crosses_chunks_and_local_rule_takes_precedence(self):
-        chunks = build_alignment_chunks(
+        chunks = build_correction_chunks(
             [
                 {"id": 0, "start": 0.0, "end": 5.0, "text": "LOS starts."},
                 {"id": 1, "start": 40.0, "end": 45.0, "text": "LOS ends."},
@@ -457,7 +421,7 @@ class SubtitleTests(unittest.TestCase):
         self.assertIsNot(corrected[0], chunks[0])
 
     def test_document_rule_does_not_modify_compound_identifiers(self):
-        chunks = build_alignment_chunks(
+        chunks = build_correction_chunks(
             [
                 {
                     "id": 0,
@@ -484,7 +448,7 @@ class SubtitleTests(unittest.TestCase):
         self.assertEqual(len(corrected[0]["occurrences"]), 2)
 
     def test_source_ids_are_unique_when_external_segment_ids_repeat(self):
-        chunks = build_alignment_chunks(
+        chunks = build_correction_chunks(
             [
                 {"id": 7, "start": 0.0, "end": 1.0, "text": "First."},
                 {"id": 7, "start": 2.0, "end": 3.0, "text": "Second."},
@@ -513,54 +477,102 @@ class SubtitleTests(unittest.TestCase):
         )
         self.assertFalse(schema["additionalProperties"])
 
-    def test_source_token_alignment_ignores_case_and_punctuation_only(self):
-        chunk = build_alignment_chunks(
-            [
-                {
-                    "id": 0,
-                    "start": 0.0,
-                    "end": 1.0,
-                    "text": "Hello, WORLD!",
-                }
-            ],
-            max_seconds=30,
-        )[0]
-        aligned = [
-            {"start": 0.0, "end": 0.4, "text": "hello"},
-            {"start": 0.5, "end": 0.9, "text": "world"},
-        ]
-
-        result = attach_source_tokens(chunk, aligned)
-
-        self.assertEqual(
-            [item["source_text"] for item in result], ["Hello,", "WORLD!"]
-        )
-        self.assertEqual(
-            [item["timing_source"] for item in result],
-            ["forced_aligner"] * 2,
-        )
-        self.assertEqual(result[1]["end"], 0.9)
-
-    def test_alignment_clamps_small_boundary_overrun_and_timestamp_jitter(self):
-        result = _validated_alignment(
-            [
-                {"start": 1.0, "end": 1.2, "text": "first"},
-                {"start": 0.97, "end": 1.4, "text": "second"},
-                {"start": 5.8, "end": 6.4, "text": "last"},
-            ],
-            audio_seconds=5.0,
-        )
-        self.assertEqual(result[1]["start"], 1.0)
-        self.assertEqual((result[-1]["start"], result[-1]["end"]), (5.0, 5.0))
-
-    def test_one_to_many_replacement_projects_over_original_timing(self):
-        chunks = build_alignment_chunks(
+    def test_source_tokens_preserve_exact_whisper_word_timestamps(self):
+        chunks = build_correction_chunks(
             [
                 {
                     "id": 0,
                     "start": 2.0,
                     "end": 4.0,
                     "text": "LOS works.",
+                    "words": [
+                        {
+                            "start": 2.1,
+                            "end": 2.7,
+                            "word": "LOS",
+                            "probability": 0.8,
+                        },
+                        {
+                            "start": 2.8,
+                            "end": 3.8,
+                            "word": "works.",
+                            "probability": 0.9,
+                        },
+                    ],
+                }
+            ],
+            max_seconds=30,
+        )
+
+        words, timing = build_whisper_timeline(chunks)
+        display = project_corrections(words, apply_correction_rules(chunks, []))
+
+        self.assertEqual(
+            [(item["start"], item["end"], item["text"]) for item in display],
+            [(2.1, 2.7, "LOS"), (2.8, 3.8, "works.")],
+        )
+        self.assertEqual(
+            [item["timing_source"] for item in display],
+            ["whisper_word", "whisper_word"],
+        )
+        self.assertEqual(timing["timing_source_counts"], {"whisper_word": 2})
+        self.assertFalse(timing["additional_timing_model_used"])
+
+    def test_whisper_tokenization_mismatch_reuses_existing_word_span(self):
+        chunks = build_correction_chunks(
+            [
+                {
+                    "id": 0,
+                    "start": 0.0,
+                    "end": 2.0,
+                    "text": "ROS 2 works.",
+                    "words": [
+                        {"start": 0.2, "end": 0.8, "word": "ROS2"},
+                        {"start": 0.9, "end": 1.5, "word": "works."},
+                    ],
+                }
+            ],
+            max_seconds=30,
+        )
+
+        words, timing = build_whisper_timeline(chunks)
+
+        self.assertEqual(
+            [(item["start"], item["end"]) for item in words],
+            [(0.2, 0.8), (0.2, 0.8), (0.9, 1.5)],
+        )
+        self.assertEqual(
+            timing["timing_source_counts"], {"whisper_reconciled": 3}
+        )
+
+    def test_missing_word_timestamps_uses_whisper_segment_boundaries(self):
+        chunks = build_correction_chunks(
+            [{"id": 0, "start": 5.0, "end": 7.0, "text": "Two words."}],
+            max_seconds=30,
+        )
+
+        words, timing = build_whisper_timeline(chunks)
+
+        self.assertEqual(
+            [(item["start"], item["end"]) for item in words],
+            [(5.0, 6.0), (6.0, 7.0)],
+        )
+        self.assertEqual(
+            timing["timing_source_counts"], {"segment_interpolation": 2}
+        )
+
+    def test_one_to_many_replacement_projects_over_original_timing(self):
+        chunks = build_correction_chunks(
+            [
+                {
+                    "id": 0,
+                    "start": 2.0,
+                    "end": 4.0,
+                    "text": "LOS works.",
+                    "words": [
+                        {"start": 2.1, "end": 2.7, "word": "LOS"},
+                        {"start": 2.8, "end": 3.8, "word": "works."},
+                    ],
                 }
             ],
             max_seconds=30,
@@ -577,31 +589,27 @@ class SubtitleTests(unittest.TestCase):
                 }
             ],
         )
-        timed_words = [
-            {
-                **token,
-                "source_text": token["text"],
-                "timing_source": "forced_aligner",
-            }
-            for token in chunks[0]["source_tokens"]
-        ]
+        timed_words, _timing = build_whisper_timeline(chunks)
 
         display = project_corrections(timed_words, corrected)
 
         self.assertEqual([item["text"] for item in display], ["ROS 2", "works."])
-        self.assertEqual(display[0]["start"], timed_words[0]["start"])
-        self.assertEqual(display[0]["end"], timed_words[0]["end"])
+        self.assertEqual((display[0]["start"], display[0]["end"]), (2.1, 2.7))
         self.assertEqual(display[0]["source_text"], "LOS")
         self.assertEqual(display[0]["correction_ids"], ["c001:o0001"])
 
-    def test_fallback_timeline_keeps_corrected_display_text(self):
-        chunks = build_alignment_chunks(
+    def test_whisper_timeline_keeps_corrected_display_text_and_timing(self):
+        chunks = build_correction_chunks(
             [
                 {
                     "id": 0,
                     "start": 5.0,
                     "end": 7.0,
                     "text": "LOS navigation.",
+                    "words": [
+                        {"start": 5.1, "end": 5.6, "word": "LOS"},
+                        {"start": 5.7, "end": 6.8, "word": "navigation."},
+                    ],
                 }
             ],
             max_seconds=30,
@@ -618,31 +626,28 @@ class SubtitleTests(unittest.TestCase):
                 }
             ],
         )
-        fallback_words = [
-            {
-                **token,
-                "source_text": token["text"],
-                "timing_source": "whisper_fallback",
-            }
-            for token in chunks[0]["source_tokens"]
-        ]
+        whisper_words, _timing = build_whisper_timeline(chunks)
 
-        display = project_corrections(fallback_words, corrected)
+        display = project_corrections(whisper_words, corrected)
 
         self.assertEqual(display[0]["text"], "ROS")
         self.assertEqual(display[0]["source_text"], "LOS")
-        self.assertEqual(display[0]["timing_source"], "whisper_fallback")
-        self.assertEqual(display[0]["start"], fallback_words[0]["start"])
-        self.assertEqual(display[0]["end"], fallback_words[0]["end"])
+        self.assertEqual(display[0]["timing_source"], "whisper_word")
+        self.assertEqual((display[0]["start"], display[0]["end"]), (5.1, 5.6))
 
     def test_projected_multiword_timing_uses_the_full_source_span(self):
-        chunks = build_alignment_chunks(
+        chunks = build_correction_chunks(
             [
                 {
                     "id": 0,
                     "start": 0.0,
                     "end": 4.0,
                     "text": "Cube Bars works.",
+                    "words": [
+                        {"start": 0.2, "end": 0.8, "word": "Cube"},
+                        {"start": 0.9, "end": 1.5, "word": "Bars"},
+                        {"start": 1.6, "end": 2.5, "word": "works."},
+                    ],
                 }
             ],
             max_seconds=30,
@@ -659,25 +664,66 @@ class SubtitleTests(unittest.TestCase):
                 }
             ],
         )
-        timed_words = [
-            {
-                **token,
-                "source_text": token["text"],
-                "start": start,
-                "end": end,
-            }
-            for token, start, end in zip(
-                chunks[0]["source_tokens"],
-                [2.0, 1.0, 3.0],
-                [3.0, 4.0, 3.5],
-            )
-        ]
+        timed_words, _timing = build_whisper_timeline(chunks)
         display = project_corrections(timed_words, corrected)
         self.assertEqual(display[0]["text"], "CubeMars")
-        self.assertEqual((display[0]["start"], display[0]["end"]), (1.0, 4.0))
+        self.assertEqual((display[0]["start"], display[0]["end"]), (0.2, 1.5))
+        self.assertEqual(
+            (display[1]["text"], display[1]["start"], display[1]["end"]),
+            ("works.", 1.6, 2.5),
+        )
+
+    def test_multiword_correction_across_asr_segments_uses_whisper_union(self):
+        chunks = build_correction_chunks(
+            [
+                {
+                    "id": 0,
+                    "start": 1.0,
+                    "end": 1.8,
+                    "text": "Cube",
+                    "words": [{"start": 1.1, "end": 1.7, "word": "Cube"}],
+                },
+                {
+                    "id": 1,
+                    "start": 1.9,
+                    "end": 3.5,
+                    "text": "Bars works.",
+                    "words": [
+                        {"start": 2.0, "end": 2.5, "word": "Bars"},
+                        {"start": 2.6, "end": 3.4, "word": "works."},
+                    ],
+                },
+            ],
+            max_seconds=30,
+        )
+        rules = [
+            {
+                "rule_id": "r001",
+                "scope_id": "document",
+                "original": "Cube Bars",
+                "replacement": "CubeMars",
+                "matched_occurrences": 1,
+            }
+        ]
+        corrected = apply_correction_rules(chunks, rules)
+        timed_words, _timing = build_whisper_timeline(chunks)
+
+        display = project_corrections(timed_words, corrected)
+        cues = build_cues(display)
+        audit = audit_correction_delivery(corrected, display, cues, rules)
+
+        self.assertEqual(
+            (display[0]["text"], display[0]["start"], display[0]["end"]),
+            ("CubeMars", 1.1, 2.5),
+        )
+        self.assertEqual(
+            (display[1]["text"], display[1]["start"], display[1]["end"]),
+            ("works.", 2.6, 3.4),
+        )
+        self.assertTrue(audit["all_selected_corrections_delivered"])
 
     def test_delivery_audit_accepts_complete_projection_and_detects_drop(self):
-        chunks = build_alignment_chunks(
+        chunks = build_correction_chunks(
             [
                 {
                     "id": 0,
@@ -698,14 +744,7 @@ class SubtitleTests(unittest.TestCase):
             }
         ]
         corrected = apply_correction_rules(chunks, rules)
-        timed_words = [
-            {
-                **token,
-                "source_text": token["text"],
-                "timing_source": "whisper_fallback",
-            }
-            for token in chunks[0]["source_tokens"]
-        ]
+        timed_words, _timing = build_whisper_timeline(chunks)
         display = project_corrections(timed_words, corrected)
         cues = build_cues(display)
 
@@ -752,7 +791,7 @@ class SubtitleTests(unittest.TestCase):
         ]
         self.assertTrue(all(len(line) <= 42 for line in text_lines))
 
-    def test_cues_normalize_overlapping_and_abnormally_long_fallback_words(self):
+    def test_cues_normalize_overlapping_and_abnormally_long_source_words(self):
         cues = build_cues(
             [
                 {"start": 1.0, "end": 15.0, "text": "so"},
